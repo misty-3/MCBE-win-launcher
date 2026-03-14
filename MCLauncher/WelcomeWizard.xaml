@@ -1,0 +1,349 @@
+<Window x:Class="MCLauncher.WelcomeWizard"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Welcome to Minecraft Version Launcher!" 
+        Height="550" Width="700"
+        WindowStartupLocation="CenterScreen"
+        Background="#F5F5F5"
+        ResizeMode="NoResize">
+    
+    <Window.Resources>
+        <SolidColorBrush x:Key="MinecraftGreen" Color="#7CB342"/>
+        <SolidColorBrush x:Key="MinecraftDarkGreen" Color="#558B2F"/>
+        <SolidColorBrush x:Key="CreeperGreen" Color="#00C853"/>
+        <SolidColorBrush x:Key="CardBackground" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="TextPrimary" Color="#212121"/>
+        <SolidColorBrush x:Key="TextSecondary" Color="#757575"/>
+
+        <Style x:Key="ModernButton" TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource MinecraftGreen}"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Padding" Value="25,12"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" 
+                                CornerRadius="5"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="{StaticResource MinecraftDarkGreen}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="BigButton" TargetType="Button" BasedOn="{StaticResource ModernButton}">
+            <Setter Property="FontSize" Value="16"/>
+            <Setter Property="Padding" Value="30,15"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <Border Grid.Row="0" Background="{StaticResource MinecraftGreen}" Padding="30">
+            <StackPanel HorizontalAlignment="Center">
+                <TextBlock Text="🎮" 
+                           FontSize="48" 
+                           HorizontalAlignment="Center"/>
+                <TextBlock Text="Welcome to Minecraft Version Launcher!" 
+                           FontSize="26" 
+                           FontWeight="Bold" 
+                           Foreground="White"
+                           HorizontalAlignment="Center"
+                           Margin="0,10,0,0"/>
+                <TextBlock Text="Let's get you set up in just a few steps!" 
+                           FontSize="14" 
+                           Foreground="White" 
+                           Opacity="0.9"
+                           HorizontalAlignment="Center"
+                           Margin="0,5,0,0"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Content Pages -->
+        <Grid Grid.Row="1" Margin="40">
+            <!-- Page 1: Welcome -->
+            <StackPanel x:Name="Page1" Visibility="Visible">
+                <TextBlock Text="What can this launcher do?" 
+                           FontSize="22" 
+                           FontWeight="Bold"
+                           Foreground="{StaticResource TextPrimary}"
+                           HorizontalAlignment="Center"
+                           Margin="0,20,0,30"/>
+
+                <Border Background="{StaticResource CardBackground}" 
+                        CornerRadius="8" 
+                        Padding="20"
+                        Margin="0,0,0,15">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="✓" 
+                                   FontSize="32"
+                                   Foreground="{StaticResource CreeperGreen}"
+                                   Margin="0,0,15,0"
+                                   VerticalAlignment="Top"/>
+                        <StackPanel>
+                            <TextBlock Text="Play different versions of Minecraft" 
+                                       FontSize="16"
+                                       FontWeight="Bold"
+                                       Foreground="{StaticResource TextPrimary}"/>
+                            <TextBlock Text="Switch between old and new versions anytime!" 
+                                       FontSize="14"
+                                       Foreground="{StaticResource TextSecondary}"
+                                       Margin="0,5,0,0"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <Border Background="{StaticResource CardBackground}" 
+                        CornerRadius="8" 
+                        Padding="20"
+                        Margin="0,0,0,15">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="✓" 
+                                   FontSize="32"
+                                   Foreground="{StaticResource CreeperGreen}"
+                                   Margin="0,0,15,0"
+                                   VerticalAlignment="Top"/>
+                        <StackPanel>
+                            <TextBlock Text="Try Preview features early" 
+                                       FontSize="16"
+                                       FontWeight="Bold"
+                                       Foreground="{StaticResource TextPrimary}"/>
+                            <TextBlock Text="Test new Minecraft features before everyone else!" 
+                                       FontSize="14"
+                                       Foreground="{StaticResource TextSecondary}"
+                                       Margin="0,5,0,0"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <Border Background="{StaticResource CardBackground}" 
+                        CornerRadius="8" 
+                        Padding="20">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="✓" 
+                                   FontSize="32"
+                                   Foreground="{StaticResource CreeperGreen}"
+                                   Margin="0,0,15,0"
+                                   VerticalAlignment="Top"/>
+                        <StackPanel>
+                            <TextBlock Text="Your worlds stay safe" 
+                                       FontSize="16"
+                                       FontWeight="Bold"
+                                       Foreground="{StaticResource TextPrimary}"/>
+                            <TextBlock Text="Automatic backups keep your creations protected!" 
+                                       FontSize="14"
+                                       Foreground="{StaticResource TextSecondary}"
+                                       Margin="0,5,0,0"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+
+            <!-- Page 2: Requirements -->
+            <StackPanel x:Name="Page2" Visibility="Collapsed">
+                <TextBlock Text="Before we start..." 
+                           FontSize="22" 
+                           FontWeight="Bold"
+                           Foreground="{StaticResource TextPrimary}"
+                           HorizontalAlignment="Center"
+                           Margin="0,20,0,30"/>
+
+                <Border Background="{StaticResource CardBackground}" 
+                        CornerRadius="8" 
+                        Padding="25"
+                        Margin="0,0,0,20">
+                    <StackPanel>
+                        <TextBlock Text="✓ You need these things:" 
+                                   FontSize="18"
+                                   FontWeight="Bold"
+                                   Foreground="{StaticResource TextPrimary}"
+                                   Margin="0,0,0,20"/>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,15">
+                            <TextBlock Text="1️⃣" FontSize="24" Margin="0,0,15,0"/>
+                            <StackPanel>
+                                <TextBlock Text="Minecraft from Microsoft Store" 
+                                           FontSize="16"
+                                           FontWeight="Bold"
+                                           Foreground="{StaticResource TextPrimary}"/>
+                                <TextBlock Text="You must have Minecraft installed from the Store first!" 
+                                           FontSize="14"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           Margin="0,3,0,0"
+                                           TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,15">
+                            <TextBlock Text="2️⃣" FontSize="24" Margin="0,0,15,0"/>
+                            <StackPanel>
+                                <TextBlock Text="At least 2GB of free space" 
+                                           FontSize="16"
+                                           FontWeight="Bold"
+                                           Foreground="{StaticResource TextPrimary}"/>
+                                <TextBlock Text="Each version takes about 500MB" 
+                                           FontSize="14"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           Margin="0,3,0,0"
+                                           TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="3️⃣" FontSize="24" Margin="0,0,15,0"/>
+                            <StackPanel>
+                                <TextBlock Text="Internet connection" 
+                                           FontSize="16"
+                                           FontWeight="Bold"
+                                           Foreground="{StaticResource TextPrimary}"/>
+                                <TextBlock Text="To download versions" 
+                                           FontSize="14"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           Margin="0,3,0,0"
+                                           TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <Border Background="#FFF3E0" 
+                        CornerRadius="8" 
+                        Padding="20"
+                        BorderBrush="#FF9800"
+                        BorderThickness="2">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="⚠️" FontSize="24" Margin="0,0,10,0" VerticalAlignment="Top"/>
+                        <TextBlock TextWrapping="Wrap" 
+                                   FontSize="14"
+                                   Foreground="{StaticResource TextPrimary}">
+                            <Bold>Important:</Bold> If you don't have Minecraft from the Store yet, 
+                            go install it first, then come back here!
+                        </TextBlock>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+
+            <!-- Page 3: Ready -->
+            <StackPanel x:Name="Page3" Visibility="Collapsed">
+                <TextBlock Text="You're all set! 🎉" 
+                           FontSize="28" 
+                           FontWeight="Bold"
+                           Foreground="{StaticResource TextPrimary}"
+                           HorizontalAlignment="Center"
+                           Margin="0,40,0,30"/>
+
+                <Border Background="{StaticResource CardBackground}" 
+                        CornerRadius="8" 
+                        Padding="30"
+                        HorizontalAlignment="Center">
+                    <StackPanel HorizontalAlignment="Center">
+                        <TextBlock Text="🎮" 
+                                   FontSize="64" 
+                                   HorizontalAlignment="Center"
+                                   Margin="0,0,0,20"/>
+                        
+                        <TextBlock Text="Quick Start Guide:" 
+                                   FontSize="18"
+                                   FontWeight="Bold"
+                                   Foreground="{StaticResource TextPrimary}"
+                                   HorizontalAlignment="Center"
+                                   Margin="0,0,0,20"/>
+
+                        <StackPanel>
+                            <TextBlock FontSize="14" 
+                                       Foreground="{StaticResource TextSecondary}"
+                                       Margin="0,0,0,10"
+                                       TextWrapping="Wrap">
+                                <Bold>1.</Bold> Go to the "Available" tab
+                            </TextBlock>
+                            <TextBlock FontSize="14" 
+                                       Foreground="{StaticResource TextSecondary}"
+                                       Margin="0,0,0,10"
+                                       TextWrapping="Wrap">
+                                <Bold>2.</Bold> Find a version with a ⭐ (recommended!)
+                            </TextBlock>
+                            <TextBlock FontSize="14" 
+                                       Foreground="{StaticResource TextSecondary}"
+                                       Margin="0,0,0,10"
+                                       TextWrapping="Wrap">
+                                <Bold>3.</Bold> Click "Download" and wait
+                            </TextBlock>
+                            <TextBlock FontSize="14" 
+                                       Foreground="{StaticResource TextSecondary}"
+                                       Margin="0,0,0,10"
+                                       TextWrapping="Wrap">
+                                <Bold>4.</Bold> Go to "My Versions" and click "PLAY"!
+                            </TextBlock>
+                        </StackPanel>
+
+                        <Border Background="#E8F5E9" 
+                                CornerRadius="5" 
+                                Padding="15"
+                                Margin="0,20,0,0">
+                            <TextBlock TextWrapping="Wrap" 
+                                       FontSize="13"
+                                       Foreground="{StaticResource TextPrimary}"
+                                       HorizontalAlignment="Center">
+                                💡 Tip: If you need help, check the "Help" tab anytime!
+                            </TextBlock>
+                        </Border>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </Grid>
+
+        <!-- Footer Navigation -->
+        <Border Grid.Row="2" Background="White" BorderBrush="#E0E0E0" BorderThickness="0,1,0,0" Padding="30,20">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <Button x:Name="BackButton" 
+                        Grid.Column="0"
+                        Content="← Back" 
+                        Style="{StaticResource ModernButton}"
+                        Background="#9E9E9E"
+                        Click="Back_Click"
+                        HorizontalAlignment="Left"
+                        Visibility="Collapsed"/>
+
+                <StackPanel Grid.Column="1" 
+                            Orientation="Horizontal" 
+                            HorizontalAlignment="Center">
+                    <Ellipse x:Name="Dot1" Width="12" Height="12" Fill="{StaticResource MinecraftGreen}" Margin="5"/>
+                    <Ellipse x:Name="Dot2" Width="12" Height="12" Fill="#E0E0E0" Margin="5"/>
+                    <Ellipse x:Name="Dot3" Width="12" Height="12" Fill="#E0E0E0" Margin="5"/>
+                </StackPanel>
+
+                <Button x:Name="NextButton" 
+                        Grid.Column="2"
+                        Content="Next →" 
+                        Style="{StaticResource BigButton}"
+                        Click="Next_Click"
+                        HorizontalAlignment="Right"/>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
