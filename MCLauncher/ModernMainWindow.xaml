@@ -53,7 +53,7 @@
             </Setter>
         </Style>
 
-        <Style x:Key="CustomScrollViewer" TargetType="ScrollViewer">
+        <Style TargetType="ScrollViewer">
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="ScrollViewer">
@@ -62,7 +62,7 @@
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
-                            <ScrollContentPresenter Grid.Column="0"/>
+                            <ScrollContentPresenter Grid.Column="0" CanContentScroll="{TemplateBinding CanContentScroll}"/>
                             <ScrollBar Grid.Column="1" 
                                       x:Name="PART_VerticalScrollBar"
                                       Style="{StaticResource CustomScrollBar}"
@@ -210,7 +210,11 @@
                                         </Style>
                                     </TextBlock.Style>
                                 </TextBlock>
-                                <ScrollViewer x:Name="PART_ContentHost" Margin="35,0,12,0" VerticalAlignment="Center"/>
+                                <ScrollViewer x:Name="PART_ContentHost" Margin="35,0,12,0" VerticalAlignment="Center">
+                                    <ScrollViewer.Style>
+                                        <Style TargetType="ScrollViewer"/>
+                                    </ScrollViewer.Style>
+                                </ScrollViewer>
                             </Grid>
                         </Border>
                     </ControlTemplate>
@@ -546,17 +550,15 @@
             </Border>
 
             <!-- Content Area -->
-            <ScrollViewer Grid.Column="1" 
-                         VerticalScrollBarVisibility="Auto" 
-                         Padding="24"
-                         Style="{StaticResource CustomScrollViewer}"
-                         PreviewMouseWheel="ScrollViewer_PreviewMouseWheel"
-                         PreviewMouseDown="ScrollViewer_PreviewMouseDown"
-                         PreviewMouseUp="ScrollViewer_PreviewMouseUp"
-                         MouseMove="ScrollViewer_MouseMove">
-                <Grid x:Name="ContentGrid">
-                    <!-- My Versions Content -->
-                    <StackPanel x:Name="MyVersionsContent" Visibility="Visible">
+            <Grid Grid.Column="1" Margin="24" x:Name="ContentGrid">
+                <!-- My Versions Content -->
+                <ScrollViewer x:Name="MyVersionsContent" Visibility="Visible"
+                             VerticalScrollBarVisibility="Auto" 
+                             PreviewMouseWheel="ScrollViewer_PreviewMouseWheel"
+                             PreviewMouseDown="ScrollViewer_PreviewMouseDown"
+                             PreviewMouseUp="ScrollViewer_PreviewMouseUp"
+                             MouseMove="ScrollViewer_MouseMove">
+                    <StackPanel>
                         <Grid Margin="0,0,0,20">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
@@ -676,14 +678,21 @@
                             </StackPanel>
                         </Border>
                     </StackPanel>
+                </ScrollViewer>
 
-                    <!-- Available Versions Content -->
-                    <StackPanel x:Name="AvailableContent" Visibility="Collapsed">
-                        <Grid Margin="0,0,0,20">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="Auto"/>
-                            </Grid.ColumnDefinitions>
+                <!-- Available Versions Content -->
+                <Grid x:Name="AvailableContent" Visibility="Collapsed">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <Grid Grid.Row="0" Margin="0,0,0,20">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
                             
                             <StackPanel Grid.Column="0" Margin="16,0,0,0">
                                 <TextBlock x:Name="BrowseHeaderText"
@@ -716,7 +725,7 @@
                         </Grid>
 
                         <!-- Filters -->
-                        <Border Style="{StaticResource Card}" Padding="16" Margin="0,0,0,16">
+                        <Border Grid.Row="1" Style="{StaticResource Card}" Padding="16" Margin="0,0,0,16">
                             <Grid>
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="Auto"/>
@@ -753,7 +762,7 @@
                         </Border>
 
                         <!-- Versions List - Highly Optimized -->
-                        <ListBox x:Name="AvailableVersionsList"
+                        <ListBox Grid.Row="2" x:Name="AvailableVersionsList"
                                  Background="Transparent"
                                  BorderThickness="0"
                                  Margin="0,16,0,0"
@@ -975,7 +984,7 @@
                         </ListBox>
 
                         <!-- Loading -->
-                        <Border x:Name="LoadingIndicator" 
+                        <Border Grid.Row="2" x:Name="LoadingIndicator" 
                                 Style="{StaticResource Card}"
                                 Padding="48"
                                 Visibility="Collapsed">
@@ -994,9 +1003,8 @@
                                            Margin="0,12,0,0"/>
                             </StackPanel>
                         </Border>
-                    </StackPanel>
                 </Grid>
-            </ScrollViewer>
+            </Grid>
         </Grid>
         </Grid>
     </Border>

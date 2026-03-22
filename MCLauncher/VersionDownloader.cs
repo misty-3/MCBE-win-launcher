@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
@@ -65,6 +65,13 @@ namespace MCLauncher {
                         
                         using (var inStream = await resp.Content.ReadAsStreamAsync())
                         {
+                            bool isPartial = resp.StatusCode == System.Net.HttpStatusCode.PartialContent;
+                            if (existingFileSize > 0 && !isPartial)
+                            {
+                                Debug.WriteLine("Server ignored Range header, starting from scratch.");
+                                existingFileSize = 0;
+                            }
+                            
                             FileMode fileMode = existingFileSize > 0 ? FileMode.Append : FileMode.Create;
                             using (var outStream = new FileStream(to, fileMode, FileAccess.Write, FileShare.None, 8192, useAsync: true))
                             {

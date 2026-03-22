@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using System.IO.Compression;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -52,6 +53,7 @@ namespace MCLauncher
         private ScrollViewer _autoScrollViewer;
         private DispatcherTimer _autoScrollTimer;
         private Ellipse _autoScrollIndicator;
+        private DispatcherTimer _searchDebounceTimer;
 
         public ModernMainWindow()
         {
@@ -88,6 +90,10 @@ namespace MCLauncher
             _autoScrollTimer = new DispatcherTimer();
             _autoScrollTimer.Interval = TimeSpan.FromMilliseconds(16); // ~60 FPS
             _autoScrollTimer.Tick += AutoScrollTimer_Tick;
+
+            _searchDebounceTimer = new DispatcherTimer();
+            _searchDebounceTimer.Interval = TimeSpan.FromMilliseconds(250);
+            _searchDebounceTimer.Tick += SearchDebounceTimer_Tick;
 
             Loaded += ModernMainWindow_Loaded;
         }
@@ -176,18 +182,19 @@ namespace MCLauncher
             EmptyState.Visibility = _installedVersions.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
             // Initial display - show all
-            _availableVersions.Clear();
-            foreach (var v in _allVersions)
-            {
-                _availableVersions.Add(v);
-            }
+            ICollectionView view = CollectionViewSource.GetDefaultView(_allVersions);
+            AvailableVersionsList.ItemsSource = view;
+            ApplyFilters();
 
-            Debug.WriteLine($"Final counts - Installed: {_installedVersions.Count}, Available: {_availableVersions.Count}");
+            Debug.WriteLine($"Final counts - Installed: {_installedVersions.Count}, Available: {_allVersions.Count}");
         }
 
         private void VersionEntryPropertyChanged(object sender, PropertyChangedEventArgs e)
         {
-            Dispatcher.Invoke(() => RefreshVersionLists());
+            if (e.PropertyName == "IsInstalled" || e.PropertyName == "IsImported" || e.PropertyName == "Name")
+            {
+                Dispatcher.InvokeAsync(() => RefreshVersionLists());
+            }
         }
 
         private System.Version ParseVersionNumber(string versionName)
@@ -865,10 +872,20 @@ namespace MCLauncher
 
         private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
         {
+            if (_searchDebounceTimer != null)
+            {
+                _searchDebounceTimer.Stop();
+                _searchDebounceTimer.Start();
+            }
+        }
+
+        private void SearchDebounceTimer_Tick(object sender, EventArgs e)
+        {
+            _searchDebounceTimer?.Stop();
             ApplyFilters();
         }
 
-        private void ApplyFilters()
+        private async void ApplyFilters()
         {
             if (_allVersions == null || _allVersions.Count == 0)
                 return;
@@ -881,18 +898,21 @@ namespace MCLauncher
             else if (FilterPreview.IsChecked == true)
                 filterType = VersionType.Preview;
 
-            var filtered = _allVersions.Where(v =>
+            var filteredList = await Task.Run(() =>
             {
-                if (filterType.HasValue && v.Version.VersionType != filterType.Value)
-                    return false;
-                if (!string.IsNullOrWhiteSpace(searchText) && !v.Version.DisplayName.ToLower().Contains(searchText))
-                    return false;
-                return true;
-            }).ToList();
+                var list = new List<ModernVersionViewModel>();
+                foreach (var v in _allVersions)
+                {
+                    if (filterType.HasValue && v.Version.VersionType != filterType.Value)
+                        continue;
+                    if (!string.IsNullOrWhiteSpace(searchText) && !v.Version.DisplayName.ToLower().Contains(searchText))
+                        continue;
+                    list.Add(v);
+                }
+                return list;
+            });
 
-            // Replace entire collection to avoid individual change notifications
-            _availableVersions = new ObservableCollection<ModernVersionViewModel>(filtered);
-            AvailableVersionsList.ItemsSource = _availableVersions;
+            AvailableVersionsList.ItemsSource = filteredList;
         }
 
         private async void RefreshVersions_Click(object sender, RoutedEventArgs e)
@@ -1111,7 +1131,16 @@ namespace MCLauncher
                     {
                         if (v.PackageType == PackageType.GDK)
                         {
-                            await Task.Run(() => Process.Start(Path.Combine(gameDir, "Minecraft.Windows.exe")));
+                            await Task.Run(() => 
+                            {
+                                var psi = new ProcessStartInfo
+                                {
+                                    FileName = Path.Combine(gameDir, "Minecraft.Windows.exe"),
+                                    WorkingDirectory = gameDir,
+                                    UseShellExecute = false
+                                };
+                                Process.Start(psi);
+                            });
                         }
                         else
                         {
@@ -1375,8 +1404,35 @@ namespace MCLauncher
             {
                 await Task.Run(() =>
                 {
-                    System.IO.Compression.ZipFile.ExtractToDirectory(filePath, directory);
-                    File.Delete(Path.Combine(directory, "AppxSignature.p7x"));
+                    string fullDestDir = Path.GetFullPath(directory);
+                    if (!fullDestDir.EndsWith(Path.DirectorySeparatorChar.ToString()))
+                    {
+                        fullDestDir += Path.DirectorySeparatorChar;
+                    }
+                    
+                    using (var archive = System.IO.Compression.ZipFile.OpenRead(filePath))
+                    {
+                        foreach (var entry in archive.Entries)
+                        {
+                            string destPath = Path.GetFullPath(Path.Combine(directory, entry.FullName));
+                            if (!destPath.StartsWith(fullDestDir, StringComparison.OrdinalIgnoreCase))
+                            {
+                                throw new IOException("Zip Slip vulnerability detected: " + entry.FullName);
+                            }
+                            if (string.IsNullOrEmpty(entry.Name))
+                            {
+                                Directory.CreateDirectory(destPath);
+                            }
+                            else
+                            {
+                                Directory.CreateDirectory(Path.GetDirectoryName(destPath));
+                                entry.ExtractToFile(destPath, true);
+                            }
+                        }
+                    }
+                    string signaturePath = Path.Combine(directory, "AppxSignature.p7x");
+                    if (File.Exists(signaturePath))
+                        File.Delete(signaturePath);
                 });
 
                 versionEntry.UpdateInstallStatus();
@@ -1544,18 +1600,19 @@ namespace MCLauncher
 
                 var exeDstPath = Path.Combine(Path.GetFullPath(directory), "Minecraft.Windows.exe");
 
-                var command = $@"Invoke-CommandInDesktopPackage `
-                            -PackageFamilyName ""{versionEntry.GamePackageFamily}"" `
-                            -App Game `
-                            -Command ""powershell.exe"" `
-                            -Args \""-Command Copy-Item '{exeSrcPath}' '{exePartialTmpPath}' -Force; Move-Item '{exePartialTmpPath}' '{exeTmpPath}'\""
-                        ";
-                Debug.WriteLine("Decrypt command: " + command);
+                // Prevent Command Injection by encoding the inner PowerShell payload
+                string innerPayload = $"Copy-Item -LiteralPath '{exeSrcPath.Replace("'", "''")}' -Destination '{exePartialTmpPath.Replace("'", "''")}' -Force; Move-Item -LiteralPath '{exePartialTmpPath.Replace("'", "''")}' -Destination '{exeTmpPath.Replace("'", "''")}'";
+                string encodedInner = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(innerPayload));
+                
+                string outerPayload = $"Invoke-CommandInDesktopPackage -PackageFamilyName '{versionEntry.GamePackageFamily.Replace("'", "''")}' -App Game -Command 'powershell.exe' -Args '-WindowStyle Hidden -EncodedCommand {encodedInner}'";
+                string encodedOuter = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(outerPayload));
+
+                Debug.WriteLine("Decrypt command (encoded): " + outerPayload);
 
                 var processInfo = new ProcessStartInfo
                 {
                     FileName = "powershell.exe",
-                    Arguments = command,
+                    Arguments = $"-NoProfile -NonInteractive -EncodedCommand {encodedOuter}",
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
