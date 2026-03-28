@@ -12,19 +12,26 @@ using namespace Windows::Security::Cryptography;
 #define WU_TOKEN_FETCH_ERROR_BASE MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x400)
 
 extern "C" __declspec(dllexport) int  __stdcall GetWUToken(wchar_t** retToken) {
+	winrt::init_apartment();
 	try {
-        winrt::init_apartment();
 		auto tokenBrokerStatics = get_activation_factory<TokenBrokerInternal, Windows::Foundation::IUnknown>();
 		auto statics = tokenBrokerStatics.as<ITokenBrokerInternalStatics>();
 		auto accounts = statics.FindAllAccountsAsync().get();
 		
-		OutputDebugStringW((L"Account count = " + std::to_wstring(accounts.Size()) + L"\n").c_str());
+		wchar_t debugBuf[256];
+		swprintf_s(debugBuf, L"Account count = %i\n", accounts.Size());
+		OutputDebugStringW(debugBuf);
+
 		if (accounts.Size() == 0)
 			return WU_NO_ACCOUNT;
-			
+
 		auto accountInfo = accounts.GetAt(0);
-		OutputDebugStringW((L"ID = " + std::wstring(accountInfo.Id().c_str()) + L"\n").c_str());
-		OutputDebugStringW((L"Name = " + std::wstring(accountInfo.UserName().c_str()) + L"\n").c_str());
+		
+		swprintf_s(debugBuf, L"ID = %s\n", accountInfo.Id().c_str());
+		OutputDebugStringW(debugBuf);
+		
+		swprintf_s(debugBuf, L"Name = %s\n", accountInfo.UserName().c_str());
+		OutputDebugStringW(debugBuf);
 
 		auto accountProvider = WebAuthenticationCoreManager::FindAccountProviderAsync(L"https://login.microsoft.com", L"consumers").get();
 		WebTokenRequest request(accountProvider, L"service::dcat.update.microsoft.com::MBI_SSL", L"{28520974-CE92-4F36-A219-3F255AF7E61E}");
@@ -35,19 +42,20 @@ extern "C" __declspec(dllexport) int  __stdcall GetWUToken(wchar_t** retToken) {
 		}
 		
 		auto token = result.ResponseData().GetAt(0).Token();
-		OutputDebugStringW(L"Token acquired securely\n");
 		
 		auto tokenBinary = CryptographicBuffer::ConvertStringToBinary(token, BinaryStringEncoding::Utf16LE);
 		auto tokenBase64 = CryptographicBuffer::EncodeToBase64String(tokenBinary);
-
+		
 		*retToken = (wchar_t*)::CoTaskMemAlloc((tokenBase64.size() + 1) * sizeof(wchar_t));
 		memcpy(*retToken, tokenBase64.data(), (tokenBase64.size() + 1) * sizeof(wchar_t));
 		return S_OK;
-	} catch (winrt::hresult_error const& ex) {
-		OutputDebugStringW((L"WUTokenHelper exception: " + std::wstring(ex.message().c_str()) + L"\n").c_str());
-		return ex.code().value;
-	} catch (...) {
-		OutputDebugStringW(L"WUTokenHelper caught unknown exception.\n");
+	}
+	catch (winrt::hresult_error const& ex) {
+		OutputDebugStringW(L"WUTokenHelper caught winrt exception!\n");
+		return ex.code();
+	}
+	catch (...) {
+		OutputDebugStringW(L"WUTokenHelper caught unknown exception!\n");
 		return E_FAIL;
 	}
 }

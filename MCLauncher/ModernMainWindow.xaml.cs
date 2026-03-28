@@ -1,12 +1,15 @@
 using Newtonsoft.Json;
-using System.IO.Compression;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
+using System.Net.Http;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -25,10 +28,15 @@ namespace MCLauncher
 {
     public partial class ModernMainWindow : Window, ICommonVersionCommands
     {
+        // P/Invoke for 8.3 short path conversion
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern uint GetShortPathName(string lpszLongPath, StringBuilder lpszShortPath, uint cchBuffer);
+        
         private static readonly string PREFS_PATH = @"preferences.json";
         private static readonly string IMPORTED_VERSIONS_PATH = @"imported_versions";
         private static readonly string VERSIONS_API_UWP = "https://mrarm.io/r/w10-vdb";
         private static readonly string VERSIONS_API_GDK = "https://raw.githubusercontent.com/MinecraftBedrockArchiver/GdkLinks/refs/heads/master/urls.min.json";
+        private static readonly string RUNNING_VERSION_PATH = @"running_version.txt";
 
         private VersionList _versions;
         public Preferences UserPrefs { get; }
@@ -37,6 +45,9 @@ namespace MCLauncher
         private readonly VersionDownloader _userVersionDownloader = new VersionDownloader();
         private readonly Task _userVersionDownloaderLoginTask;
         private volatile bool _hasLaunchTask = false;
+        
+        // Track currently running Minecraft version
+        private WPFDataTypes.Version _runningVersion = null;
 
         private ObservableCollection<ModernVersionViewModel> _installedVersions;
         private ObservableCollection<ModernVersionViewModel> _availableVersions;
@@ -45,7 +56,17 @@ namespace MCLauncher
         // Download pause/resume tracking
         private Dictionary<WPFDataTypes.Version, CancellationTokenSource> _downloadCancelTokens = new Dictionary<WPFDataTypes.Version, CancellationTokenSource>();
         private Dictionary<WPFDataTypes.Version, bool> _downloadPausedState = new Dictionary<WPFDataTypes.Version, bool>();
-        private volatile bool _hasGdkExtractTask = false;
+        private readonly SemaphoreSlim _gdkExtractSemaphore = new SemaphoreSlim(1, 1); // ATOMIC: Only one GDK extraction at a time
+        
+        // Active downloads tracking
+        private HashSet<WPFDataTypes.Version> _activeDownloads = new HashSet<WPFDataTypes.Version>();
+        private object _downloadLock = new object();
+        
+        // CRITICAL: Protect concurrent extractions and file operations
+        private readonly SemaphoreSlim _extractionSemaphore = new SemaphoreSlim(4, 4); // Allow 4 concurrent UWP extractions max
+        private readonly object _prefsLock = new object(); // Protect preferences.json writes
+        private Window _activeDownloadsDialog = null;
+        private System.Windows.Threading.DispatcherTimer _downloadDialogUpdateTimer = null;
 
         // Auto-scroll support
         private bool _isAutoScrolling = false;
@@ -53,17 +74,32 @@ namespace MCLauncher
         private ScrollViewer _autoScrollViewer;
         private DispatcherTimer _autoScrollTimer;
         private Ellipse _autoScrollIndicator;
-        private DispatcherTimer _searchDebounceTimer;
+        
+        // Minecraft version monitoring (lightweight process check)
+        private DispatcherTimer _versionMonitorTimer;
+        private bool _wasMinecraftRunning = false;
+        private string _cachedSystemVersion = null;
+        private DateTime _lastSystemVersionCheck = DateTime.MinValue;
 
         public ModernMainWindow()
         {
             InitializeComponent();
 
+            // Apply custom colors from preferences if set
+            ApplyCustomColors();
+
             // Load embedded icon
             var icon = EmbeddedIcon.GetIcon();
             if (icon != null)
             {
-                HeaderIcon.Source = icon;
+                MyVersionsHeaderIcon.Source = icon;
+            }
+
+            // Load embedded avatar
+            var avatar = EmbeddedAvatar.GetAvatar();
+            if (avatar != null)
+            {
+                CreatorAvatar.Source = avatar;
             }
 
             // Load preferences
@@ -97,26 +133,61 @@ namespace MCLauncher
             _autoScrollTimer = new DispatcherTimer();
             _autoScrollTimer.Interval = TimeSpan.FromMilliseconds(16); // ~60 FPS
             _autoScrollTimer.Tick += AutoScrollTimer_Tick;
-
-            _searchDebounceTimer = new DispatcherTimer();
-            _searchDebounceTimer.Interval = TimeSpan.FromMilliseconds(250);
-            _searchDebounceTimer.Tick += SearchDebounceTimer_Tick;
+            
+            // Initialize lightweight Minecraft version monitor (process check only)
+            _versionMonitorTimer = new DispatcherTimer();
+            _versionMonitorTimer.Interval = TimeSpan.FromSeconds(3);
+            _versionMonitorTimer.Tick += VersionMonitorTimer_Tick;
+            _versionMonitorTimer.Start();
 
             Loaded += ModernMainWindow_Loaded;
+            Closing += (s, e) => 
+            {
+                Debug.WriteLine("ModernMainWindow is closing");
+                // Cleanup timers
+                _versionMonitorTimer?.Stop();
+                _autoScrollTimer?.Stop();
+                _downloadDialogUpdateTimer?.Stop();
+            };
+            Closed += (s, e) => Debug.WriteLine("ModernMainWindow has closed");
+            
+            Debug.WriteLine("ModernMainWindow constructor completed");
         }
+        
 
         private async void ModernMainWindow_Loaded(object sender, RoutedEventArgs e)
         {
-            // Load saved language preference
-            SetLanguage(UserPrefs.Language ?? "en");
-            
-            // Check status indicators
-            UpdateStatusIndicators();
-            
-
-            await LoadVersionList();
+            try
+            {
+                Debug.WriteLine("ModernMainWindow_Loaded started");
+                
+                // Load saved language preference
+                SetLanguage(UserPrefs.Language ?? "en");
+                Debug.WriteLine("Language set");
+                
+                // Check status indicators
+                UpdateStatusIndicators();
+                Debug.WriteLine("Status indicators updated");
+                
+                Debug.WriteLine("Starting LoadVersionList");
+                await LoadVersionList();
+                Debug.WriteLine("ModernMainWindow_Loaded completed successfully");
+                
+                // CRITICAL: Initial title update after loading
+                UpdateWindowTitle();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"ERROR in ModernMainWindow_Loaded: {ex.Message}");
+                Debug.WriteLine($"Stack trace: {ex.StackTrace}");
+                MessageBox.Show(
+                    $"Failed to load main window:\n\n{ex.Message}\n\nCheck Log.txt for details.",
+                    "Startup Error",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+                Application.Current.Shutdown();
+            }
         }
-
         private async Task LoadVersionList()
         {
             LoadingIndicator.Visibility = Visibility.Visible;
@@ -164,6 +235,10 @@ namespace MCLauncher
 
             RefreshVersionLists();
             Debug.WriteLine($"Refreshed lists - Installed: {_installedVersions.Count}, Available: {_availableVersions.Count}");
+            
+            // CRITICAL: Force WPF to re-evaluate all command CanExecute predicates
+            // Without this, buttons stay grayed out until user interaction
+            System.Windows.Input.CommandManager.InvalidateRequerySuggested();
         }
 
         private void RefreshVersionLists()
@@ -173,11 +248,21 @@ namespace MCLauncher
 
             Debug.WriteLine($"RefreshVersionLists called - Total versions: {_versions.Count}");
 
+            // Load registered version if not already loaded
+            if (_runningVersion == null)
+            {
+                _runningVersion = LoadRunningVersion();
+            }
+
             foreach (var version in _versions)
             {
                 var viewModel = new ModernVersionViewModel(version, this);
+                
+                // Mark if this is the registered version
+                viewModel.IsRegistered = (_runningVersion != null && version == _runningVersion);
 
-                if (version.IsInstalled)
+                // Add to installed list if it's actually installed OR if it's an imported version (even if not yet extracted)
+                if (version.IsInstalled || version.IsImported)
                 {
                     _installedVersions.Add(viewModel);
                 }
@@ -189,18 +274,53 @@ namespace MCLauncher
             EmptyState.Visibility = _installedVersions.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
             // Initial display - show all
-            ICollectionView view = CollectionViewSource.GetDefaultView(_allVersions);
-            AvailableVersionsList.ItemsSource = view;
-            ApplyFilters();
+            _availableVersions.Clear();
+            foreach (var v in _allVersions)
+            {
+                _availableVersions.Add(v);
+            }
 
-            Debug.WriteLine($"Final counts - Installed: {_installedVersions.Count}, Available: {_allVersions.Count}");
+            Debug.WriteLine($"Final counts - Installed: {_installedVersions.Count}, Available: {_availableVersions.Count}");
+            
+            // CRITICAL: Force command re-evaluation after list refresh
+            System.Windows.Input.CommandManager.InvalidateRequerySuggested();
         }
 
         private void VersionEntryPropertyChanged(object sender, PropertyChangedEventArgs e)
         {
-            if (e.PropertyName == "IsInstalled" || e.PropertyName == "IsImported" || e.PropertyName == "Name")
-            {
-                Dispatcher.InvokeAsync(() => RefreshVersionLists());
+            Dispatcher.Invoke(() => {
+                RefreshVersionLists();
+                // CRITICAL: Update window title to show busy state for user feedback
+                if (e.PropertyName == "IsStateChanging" || e.PropertyName == "StateChangeInfo") {
+                    UpdateWindowTitle();
+                }
+                // CRITICAL: Force command re-evaluation on any property change
+                System.Windows.Input.CommandManager.InvalidateRequerySuggested();
+            });
+        }
+
+        private void UpdateWindowTitle() {
+            // CRITICAL: Visual feedback for users - show busy state in title
+            var stagingVersion = _versions.FirstOrDefault(v => v.StateChangeInfo?.VersionState == VersionState.Staging);
+            var unregisteringVersion = _versions.FirstOrDefault(v => v.StateChangeInfo?.VersionState == VersionState.Unregistering);
+            var registeringVersion = _versions.FirstOrDefault(v => v.StateChangeInfo?.VersionState == VersionState.Registering);
+            
+            if (stagingVersion != null) {
+                // Show staging prominently - it blocks all other operations
+                this.Title = $"⚠️ STAGING IN PROGRESS - Please wait... (All operations disabled)";
+            } else if (unregisteringVersion != null) {
+                // Show unregistering prominently - it blocks all other operations
+                this.Title = $"⚠️ UNREGISTERING PACKAGE - Please wait... (All operations disabled)";
+            } else if (registeringVersion != null) {
+                // Show registering prominently - it blocks all other operations
+                this.Title = $"⚠️ REGISTERING PACKAGE - Please wait... (All operations disabled)";
+            } else {
+                int busyCount = _versions.Count(v => v.IsStateChanging);
+                if (busyCount > 0) {
+                    this.Title = $"⏳ Minecraft Bedrock Launcher - {busyCount} operation(s) in progress...";
+                } else {
+                    this.Title = "Minecraft Bedrock Launcher";
+                }
             }
         }
 
@@ -234,21 +354,32 @@ namespace MCLauncher
             return new System.Version(0, 0, 0, 0);
         }
 
-        // Get the versions folder path in AppData
-        private static string GetVersionsFolder()
+        // Get the versions folder path - respects custom launcher data path
+        private string GetVersionsFolder()
         {
-            string appDataPath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "MinecraftVersionLauncher",
-                "Versions");
+            string basePath;
             
-            // Create directory if it doesn't exist
-            if (!Directory.Exists(appDataPath))
+            // Use custom path if set, otherwise use default
+            if (!string.IsNullOrEmpty(UserPrefs.LauncherDataPath))
             {
-                Directory.CreateDirectory(appDataPath);
+                basePath = UserPrefs.LauncherDataPath;
+            }
+            else
+            {
+                basePath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "MinecraftVersionLauncher");
             }
             
-            return appDataPath;
+            string versionsPath = Path.Combine(basePath, "Versions");
+            
+            // Create directory if it doesn't exist
+            if (!Directory.Exists(versionsPath))
+            {
+                Directory.CreateDirectory(versionsPath);
+            }
+            
+            return versionsPath;
         }
 
         // Open the versions folder in Windows Explorer
@@ -279,6 +410,234 @@ namespace MCLauncher
 
             MyVersionsContent.Visibility = MyVersionsTab.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
             AvailableContent.Visibility = AvailableTab.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+        }
+        // Show version selection dialog with registered version highlighted in green
+        private async Task<WPFDataTypes.Version> ShowVersionSelectionDialog(List<WPFDataTypes.Version> installedVersions, WPFDataTypes.Version registeredVersion)
+        {
+            var tcs = new TaskCompletionSource<WPFDataTypes.Version>();
+            
+            await Dispatcher.InvokeAsync(() =>
+            {
+                var dialog = new System.Windows.Window
+                {
+                    Title = Localization.Get("SelectMinecraftVersion"),
+                    Width = 550,
+                    Height = 400,
+                    WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                    Owner = this,
+                    Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#0A150C")),
+                    WindowStyle = WindowStyle.None,
+                    AllowsTransparency = true,
+                    ResizeMode = ResizeMode.NoResize
+                };
+                
+                var mainBorder = new Border
+                {
+                    Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#152818")),
+                    BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                    BorderThickness = new Thickness(2),
+                    CornerRadius = new CornerRadius(16),
+                    Margin = new Thickness(10)
+                };
+                
+                var grid = new Grid { Margin = new Thickness(24) };
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                
+                // Header
+                var headerGrid = new Grid { Margin = new Thickness(0, 0, 0, 20) };
+                headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                
+                var titleText = new TextBlock
+                {
+                    Text = "🎮 " + Localization.Get("SelectVersionPrompt"),
+                    FontSize = 18,
+                    FontWeight = FontWeights.Bold,
+                    Foreground = Brushes.White,
+                    TextWrapping = TextWrapping.Wrap,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                Grid.SetColumn(titleText, 0);
+                headerGrid.Children.Add(titleText);
+                
+                // Close button
+                var closeBtn = new Button
+                {
+                    Content = "✕",
+                    Width = 32,
+                    Height = 32,
+                    Background = Brushes.Transparent,
+                    Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#A0B5A3")),
+                    BorderThickness = new Thickness(0),
+                    FontSize = 20,
+                    FontWeight = FontWeights.Bold,
+                    Cursor = Cursors.Hand
+                };
+                closeBtn.Click += (s, args) => { tcs.TrySetResult(null); dialog.Close(); };
+                Grid.SetColumn(closeBtn, 1);
+                headerGrid.Children.Add(closeBtn);
+                
+                Grid.SetRow(headerGrid, 0);
+                grid.Children.Add(headerGrid);
+                
+                // Version list
+                var listBox = new ListBox
+                {
+                    Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#0D1B0F")),
+                    Foreground = Brushes.White,
+                    BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                    BorderThickness = new Thickness(1),
+                    FontSize = 14,
+                    Padding = new Thickness(8)
+                };
+                
+                int selectedIndex = 0;
+                WPFDataTypes.Version bestVersion = DetermineBestVersionToSelect(installedVersions, registeredVersion);
+                
+                for (int i = 0; i < installedVersions.Count; i++)
+                {
+                    var version = installedVersions[i];
+                    bool isRegistered = registeredVersion != null && version == registeredVersion;
+                    bool isBestMatch = bestVersion != null && version == bestVersion;
+                    
+                    var itemGrid = new Grid();
+                    itemGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                    itemGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                    
+                    var versionText = new TextBlock
+                    {
+                        Text = (version.VersionType == VersionType.Preview ? "✨ " : "⭐ ") + version.Name,
+                        VerticalAlignment = VerticalAlignment.Center
+                    };
+                    Grid.SetColumn(versionText, 0);
+                    itemGrid.Children.Add(versionText);
+                    
+                    // Show indicator for best match (green) or registered (yellow)
+                    if (isBestMatch || isRegistered)
+                    {
+                        var indicator = new Ellipse
+                        {
+                            Width = 12,
+                            Height = 12,
+                            Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString(isBestMatch ? "#00FF00" : "#FFD700")),
+                            Margin = new Thickness(8, 0, 0, 0),
+                            VerticalAlignment = VerticalAlignment.Center
+                        };
+                        
+                        // Pulsing animation for best match
+                        if (isBestMatch)
+                        {
+                            var animation = new System.Windows.Media.Animation.DoubleAnimation
+                            {
+                                From = 1.0,
+                                To = 0.3,
+                                Duration = TimeSpan.FromSeconds(0.8),
+                                AutoReverse = true,
+                                RepeatBehavior = System.Windows.Media.Animation.RepeatBehavior.Forever
+                            };
+                            indicator.BeginAnimation(Ellipse.OpacityProperty, animation);
+                        }
+                        
+                        Grid.SetColumn(indicator, 1);
+                        itemGrid.Children.Add(indicator);
+                        
+                        if (isBestMatch)
+                        {
+                            selectedIndex = i; // Auto-select best match
+                        }
+                    }
+                    
+                    var item = new ListBoxItem
+                    {
+                        Content = itemGrid,
+                        Padding = new Thickness(12, 10, 12, 10),
+                        Margin = new Thickness(0, 0, 0, 4),
+                        Tag = version
+                    };
+                    
+                    // Green highlight for best match, subtle yellow for registered
+                    if (isBestMatch)
+                    {
+                        item.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1A3D1F"));
+                    }
+                    else if (isRegistered)
+                    {
+                        item.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#2A2A1A"));
+                    }
+                    
+                    listBox.Items.Add(item);
+                }
+                
+                listBox.SelectedIndex = selectedIndex;
+                Grid.SetRow(listBox, 1);
+                grid.Children.Add(listBox);
+                
+                // Button panel
+                var buttonPanel = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                    Margin = new Thickness(0, 20, 0, 0)
+                };
+                
+                var cancelButton = new Button
+                {
+                    Content = Localization.Get("Cancel"),
+                    Width = 120,
+                    Height = 40,
+                    Margin = new Thickness(0, 0, 10, 0),
+                    Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1D3520")),
+                    Foreground = Brushes.White,
+                    FontSize = 14,
+                    FontWeight = FontWeights.SemiBold,
+                    BorderThickness = new Thickness(0),
+                    Cursor = Cursors.Hand
+                };
+                cancelButton.Click += (s, args) => { tcs.TrySetResult(null); dialog.Close(); };
+                
+                var okButton = new Button
+                {
+                    Content = "▶️ " + Localization.Get("Launch"),
+                    Width = 120,
+                    Height = 40,
+                    Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                    Foreground = Brushes.White,
+                    FontSize = 14,
+                    FontWeight = FontWeights.Bold,
+                    BorderThickness = new Thickness(0),
+                    Cursor = Cursors.Hand
+                };
+                okButton.Click += (s, args) =>
+                {
+                    if (listBox.SelectedIndex >= 0)
+                    {
+                        var selectedItem = listBox.Items[listBox.SelectedIndex] as ListBoxItem;
+                        tcs.TrySetResult(selectedItem?.Tag as WPFDataTypes.Version);
+                    }
+                    else
+                    {
+                        tcs.TrySetResult(null);
+                    }
+                    dialog.Close();
+                };
+                
+                buttonPanel.Children.Add(cancelButton);
+                buttonPanel.Children.Add(okButton);
+                Grid.SetRow(buttonPanel, 2);
+                grid.Children.Add(buttonPanel);
+                
+                mainBorder.Child = grid;
+                dialog.Content = mainBorder;
+                
+                // Allow dragging
+                mainBorder.MouseLeftButtonDown += (s, ev) => { if (ev.ClickCount == 1) dialog.DragMove(); };
+                
+                dialog.ShowDialog();
+            });
+            
+            return await tcs.Task;
         }
 
         // Custom Window Controls
@@ -348,7 +707,7 @@ namespace MCLauncher
             // Update button styles to highlight selected language
             if (languageCode == "en")
             {
-                EnglishButton.Foreground = new SolidColorBrush(Color.FromRgb(74, 222, 128)); // Green
+                EnglishButton.Foreground = new SolidColorBrush(Color.FromRgb(0, 227, 252)); // #00e3fc
                 EnglishButton.FontWeight = FontWeights.SemiBold;
                 ArabicButton.Foreground = new SolidColorBrush(Color.FromRgb(156, 163, 175)); // Gray
                 ArabicButton.FontWeight = FontWeights.Normal;
@@ -358,7 +717,7 @@ namespace MCLauncher
             }
             else if (languageCode == "ar")
             {
-                ArabicButton.Foreground = new SolidColorBrush(Color.FromRgb(74, 222, 128)); // Green
+                ArabicButton.Foreground = new SolidColorBrush(Color.FromRgb(0, 227, 252)); // #00e3fc
                 ArabicButton.FontWeight = FontWeights.SemiBold;
                 EnglishButton.Foreground = new SolidColorBrush(Color.FromRgb(156, 163, 175)); // Gray
                 EnglishButton.FontWeight = FontWeights.Normal;
@@ -390,10 +749,6 @@ namespace MCLauncher
             // Update window title
             this.Title = Localization.Get("AppTitle");
             
-            // Update header
-            if (HeaderTitle != null)
-                HeaderTitle.Text = Localization.Get("AppTitle");
-            
             // Update navigation
             if (NavigationLabel != null)
                 NavigationLabel.Text = Localization.Get("Navigation");
@@ -408,6 +763,8 @@ namespace MCLauncher
                 MyVersionsSubtitleText.Text = Localization.Get("MyVersionsSubtitle");
             if (ImportButton != null)
                 ImportButton.Content = Localization.Get("ImportFile");
+            if (ViewFilesButton != null)
+                ViewFilesButton.Content = Localization.Get("ViewFiles");
             
             // Update empty state
             if (EmptyStateTitle != null)
@@ -418,12 +775,6 @@ namespace MCLauncher
                 BrowseVersionsButton.Content = Localization.Get("BrowseVersionsButton");
             
             // Update Browse section
-            if (BrowseHeaderText != null)
-                BrowseHeaderText.Text = Localization.Get("BrowseVersionsHeader");
-            if (BrowseSubtitleText != null)
-                BrowseSubtitleText.Text = Localization.Get("BrowseVersionsSubtitle");
-            if (ViewFilesButton != null)
-                ViewFilesButton.Content = Localization.Get("ViewFiles");
             if (RefreshButton != null)
                 RefreshButton.Content = Localization.Get("Refresh");
             
@@ -448,104 +799,56 @@ namespace MCLauncher
             
             // Update status indicators
             UpdateStatusIndicators();
+            
+            // Update Settings button tooltip
+            if (SettingsButton != null)
+                SettingsButton.ToolTip = Localization.Get("SettingsTitle");
+            
+            // Update Made by text
+            if (MadeByText != null)
+                MadeByText.Text = Localization.Get("MadeBy");
+            
+            // Refresh all version view models to update localized text
+            RefreshVersionViewModels();
+        }
+        
+        private void RefreshVersionViewModels()
+        {
+            // Trigger property change notifications on all version view models
+            // This updates localized properties like FriendlyStatus, PackageTypeDisplay, etc.
+            foreach (var vm in _installedVersions)
+            {
+                vm.OnPropertyChanged("FriendlyStatus");
+                vm.OnPropertyChanged("PackageTypeDisplay");
+                vm.OnPropertyChanged("VersionTypeDisplay");
+                vm.OnPropertyChanged("PlayButtonText");
+                vm.OnPropertyChanged("DownloadButtonText");
+                vm.OnPropertyChanged("RemoveTooltipText");
+                vm.OnPropertyChanged("PauseResumeButtonText");
+                vm.OnPropertyChanged("CancelButtonText");
+            }
+            
+            foreach (var vm in _availableVersions)
+            {
+                vm.OnPropertyChanged("FriendlyStatus");
+                vm.OnPropertyChanged("PackageTypeDisplay");
+                vm.OnPropertyChanged("VersionTypeDisplay");
+                vm.OnPropertyChanged("PlayButtonText");
+                vm.OnPropertyChanged("DownloadButtonText");
+                vm.OnPropertyChanged("RemoveTooltipText");
+                vm.OnPropertyChanged("PauseResumeButtonText");
+                vm.OnPropertyChanged("CancelButtonText");
+            }
         }
 
         private void UpdateStatusIndicators()
         {
-            // Update Developer Mode indicator text
+            // Update indicator text based on language
             if (DevModeText != null)
                 DevModeText.Text = Localization.Get("DeveloperMode");
             
-            // Update Decryption Keys indicator text
-            if (DecryptKeysText != null)
-                DecryptKeysText.Text = Localization.Get("DecryptionKeys");
-            
-            // Check and update status
-            CheckDeveloperModeStatus();
-            CheckDecryptionKeysStatus();
-        }
-
-        private void CheckDeveloperModeStatus()
-        {
-            bool isEnabled = IsDeveloperModeEnabled();
-            
-            if (DevModeStatus != null && DevModeIndicator != null)
-            {
-                if (isEnabled)
-                {
-                    DevModeStatus.Text = "✓";
-                    DevModeStatus.Foreground = new SolidColorBrush(Color.FromRgb(74, 222, 128)); // Green
-                    DevModeIndicator.BorderBrush = new SolidColorBrush(Color.FromRgb(42, 42, 42));
-                }
-                else
-                {
-                    DevModeStatus.Text = "✗";
-                    DevModeStatus.Foreground = new SolidColorBrush(Color.FromRgb(239, 68, 68)); // Red
-                    DevModeIndicator.BorderBrush = new SolidColorBrush(Color.FromRgb(239, 68, 68)); // Red border to highlight
-                }
-            }
-        }
-
-        private void CheckDecryptionKeysStatus()
-        {
-            bool hasKeys = HasDecryptionKeys();
-            
-            if (DecryptKeysStatus != null && DecryptKeysIndicator != null)
-            {
-                if (hasKeys)
-                {
-                    DecryptKeysStatus.Text = "✓";
-                    DecryptKeysStatus.Foreground = new SolidColorBrush(Color.FromRgb(74, 222, 128)); // Green
-                    DecryptKeysIndicator.BorderBrush = new SolidColorBrush(Color.FromRgb(42, 42, 42));
-                }
-                else
-                {
-                    DecryptKeysStatus.Text = "✗";
-                    DecryptKeysStatus.Foreground = new SolidColorBrush(Color.FromRgb(239, 68, 68)); // Red
-                    DecryptKeysIndicator.BorderBrush = new SolidColorBrush(Color.FromRgb(239, 68, 68)); // Red border to highlight
-                }
-            }
-        }
-
-        private bool IsDeveloperModeEnabled()
-        {
-            try
-            {
-                // Check both possible registry locations
-                using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"))
-                {
-                    if (key != null)
-                    {
-                        var value = key.GetValue("AllowDevelopmentWithoutDevLicense");
-                        if (value != null && (int)value == 1)
-                        {
-                            Debug.WriteLine("Developer Mode: Enabled (AllowDevelopmentWithoutDevLicense = 1)");
-                            return true;
-                        }
-                    }
-                }
-                
-                // Also check AllowAllTrustedApps as fallback
-                using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"))
-                {
-                    if (key != null)
-                    {
-                        var value = key.GetValue("AllowAllTrustedApps");
-                        if (value != null && (int)value == 1)
-                        {
-                            Debug.WriteLine("Developer Mode: Enabled (AllowAllTrustedApps = 1)");
-                            return true;
-                        }
-                    }
-                }
-                
-                Debug.WriteLine("Developer Mode: Disabled");
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Developer Mode check failed: {ex.Message}");
-            }
-            return false;
+            if (DecryptionKeysText != null)
+                DecryptionKeysText.Text = Localization.Get("DecryptionKeys");
         }
 
         private bool HasDecryptionKeys()
@@ -588,6 +891,50 @@ namespace MCLauncher
             return false;
         }
 
+
+
+        private bool IsDeveloperModeEnabled()
+        {
+            try
+            {
+                // Check both possible registry locations
+                using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"))
+                {
+                    if (key != null)
+                    {
+                        var value = key.GetValue("AllowDevelopmentWithoutDevLicense");
+                        if (value != null && (int)value == 1)
+                        {
+                            Debug.WriteLine("Developer Mode: Enabled (AllowDevelopmentWithoutDevLicense = 1)");
+                            return true;
+                        }
+                    }
+                }
+                
+                // Also check AllowAllTrustedApps as fallback
+                using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"))
+                {
+                    if (key != null)
+                    {
+                        var value = key.GetValue("AllowAllTrustedApps");
+                        if (value != null && (int)value == 1)
+                        {
+                            Debug.WriteLine("Developer Mode: Enabled (AllowAllTrustedApps = 1)");
+                            return true;
+                        }
+                    }
+                }
+                
+                Debug.WriteLine("Developer Mode: Disabled");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Developer Mode check failed: {ex.Message}");
+            }
+            return false;
+        }
+
+
         private void DevModeIndicator_Click(object sender, MouseButtonEventArgs e)
         {
             if (!IsDeveloperModeEnabled())
@@ -601,35 +948,6 @@ namespace MCLauncher
                 if (result == MessageBoxResult.OK)
                 {
                     EnableDeveloperMode();
-                }
-            }
-        }
-
-        private void DecryptKeysIndicator_Click(object sender, MouseButtonEventArgs e)
-        {
-            if (!HasDecryptionKeys())
-            {
-                var result = MessageBox.Show(
-                    Localization.Get("DecryptKeysRequiredMessage"),
-                    Localization.Get("DecryptKeysRequired"),
-                    MessageBoxButton.OKCancel,
-                    MessageBoxImage.Warning);
-                
-                if (result == MessageBoxResult.OK)
-                {
-                    // Open Microsoft Store to Minecraft page
-                    try
-                    {
-                        Process.Start(new ProcessStartInfo
-                        {
-                            FileName = "ms-windows-store://pdp/?ProductId=9NBLGGH2JHXJ",
-                            UseShellExecute = true
-                        });
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"Failed to open Store: {ex.Message}");
-                    }
                 }
             }
         }
@@ -659,9 +977,6 @@ namespace MCLauncher
                         Localization.Get("DevModeEnabled"),
                         MessageBoxButton.OK,
                         MessageBoxImage.Information);
-                    
-                    // Update status indicator
-                    CheckDeveloperModeStatus();
                 }
                 else
                 {
@@ -682,6 +997,36 @@ namespace MCLauncher
                 Localization.Get("DevModeEnableFailed"),
                 MessageBoxButton.OK,
                 MessageBoxImage.Information);
+        }
+
+        private void DecryptionKeysIndicator_Click(object sender, MouseButtonEventArgs e)
+        {
+            if (!HasDecryptionKeys())
+            {
+                var result = MessageBox.Show(
+                    Localization.Get("DecryptKeysRequiredMessage"),
+                    Localization.Get("DecryptKeysRequired"),
+                    MessageBoxButton.OKCancel,
+                    MessageBoxImage.Warning);
+                
+                if (result == MessageBoxResult.OK)
+                {
+                    // Open Microsoft Store to Minecraft page
+                    try
+                    {
+                        Process.Start(new ProcessStartInfo
+                        {
+                            FileName = "ms-windows-store://pdp/?ProductId=9NBLGGH2JHXJ",
+                            UseShellExecute = true
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Failed to open Store: {ex.Message}");
+                    }
+                }
+            }
+            // If keys are installed, do nothing (indicator is not clickable)
         }
 
         // Native Windows mouse scrolling support
@@ -874,25 +1219,24 @@ namespace MCLauncher
             if (_allVersions == null || _allVersions.Count == 0)
                 return;
                 
-            ApplyFilters();
+            _ = ApplyFiltersAsync();
         }
 
-        private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
+        private System.Threading.CancellationTokenSource _searchCts;
+        private async void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
         {
-            if (_searchDebounceTimer != null)
+            _searchCts?.Cancel();
+            _searchCts = new System.Threading.CancellationTokenSource();
+            var token = _searchCts.Token;
+            try 
             {
-                _searchDebounceTimer.Stop();
-                _searchDebounceTimer.Start();
-            }
+                await Task.Delay(250, token);
+                await ApplyFiltersAsync();
+            } 
+            catch (TaskCanceledException) { }
         }
 
-        private void SearchDebounceTimer_Tick(object sender, EventArgs e)
-        {
-            _searchDebounceTimer?.Stop();
-            ApplyFilters();
-        }
-
-        private async void ApplyFilters()
+        private async Task ApplyFiltersAsync()
         {
             if (_allVersions == null || _allVersions.Count == 0)
                 return;
@@ -905,21 +1249,18 @@ namespace MCLauncher
             else if (FilterPreview.IsChecked == true)
                 filterType = VersionType.Preview;
 
-            var filteredList = await Task.Run(() =>
+            var filtered = await Task.Run(() => _allVersions.Where(v =>
             {
-                var list = new List<ModernVersionViewModel>();
-                foreach (var v in _allVersions)
-                {
-                    if (filterType.HasValue && v.Version.VersionType != filterType.Value)
-                        continue;
-                    if (!string.IsNullOrWhiteSpace(searchText) && !v.Version.DisplayName.ToLower().Contains(searchText))
-                        continue;
-                    list.Add(v);
-                }
-                return list;
-            });
+                if (filterType.HasValue && v.Version.VersionType != filterType.Value)
+                    return false;
+                if (!string.IsNullOrWhiteSpace(searchText) && !v.Version.DisplayName.ToLower().Contains(searchText))
+                    return false;
+                return true;
+            }).ToList());
 
-            AvailableVersionsList.ItemsSource = filteredList;
+            // Replace entire collection to avoid individual change notifications
+            _availableVersions = new ObservableCollection<ModernVersionViewModel>(filtered);
+            AvailableVersionsList.ItemsSource = _availableVersions;
         }
 
         private async void RefreshVersions_Click(object sender, RoutedEventArgs e)
@@ -927,99 +1268,143 @@ namespace MCLauncher
             await LoadVersionList();
         }
 
+        private volatile bool _hasImportTask = false;
+
         private async void ImportButton_Click(object sender, RoutedEventArgs e)
         {
-            Microsoft.Win32.OpenFileDialog openFileDlg = new Microsoft.Win32.OpenFileDialog();
-            openFileDlg.Filter = "Minecraft Packages (*.msixvc, *.appx)|*.msixvc;*.appx|All Files|*.*";
-            openFileDlg.Title = "Choose a Minecraft package file";
-            
-            Nullable<bool> result = openFileDlg.ShowDialog();
-            if (result == true)
+            // Block concurrent imports
+            if (_hasImportTask)
             {
-                string directory = Path.Combine(IMPORTED_VERSIONS_PATH, openFileDlg.SafeFileName);
+                MessageBox.Show(
+                    Localization.Get("ImportInProgressMessage"), 
+                    Localization.Get("ImportInProgress"), 
+                    MessageBoxButton.OK, 
+                    MessageBoxImage.Information);
+                return;
+            }
+            
+            _hasImportTask = true;
+            
+            try
+            {
+                Microsoft.Win32.OpenFileDialog openFileDlg = new Microsoft.Win32.OpenFileDialog();
+                openFileDlg.Filter = "Minecraft Packages (*.msixvc, *.appx)|*.msixvc;*.appx|All Files|*.*";
+                openFileDlg.Title = "Choose a Minecraft package file";
                 
-                // Check if already exists
-                if (Directory.Exists(directory))
+                Nullable<bool> result = openFileDlg.ShowDialog();
+                
+                if (result == true)
                 {
-                    var existingVersion = _versions.FirstOrDefault(v => v.IsImported && v.GameDirectory == directory);
-                    if (existingVersion != null)
+                    string directory = Path.Combine(IMPORTED_VERSIONS_PATH, openFileDlg.SafeFileName);
+                    
+                    // Check if already exists
+                    if (Directory.Exists(directory))
                     {
-                        if (existingVersion.IsStateChanging)
+                        var existingVersion = _versions.FirstOrDefault(v => v.IsImported && v.GameDirectory == directory);
+                        if (existingVersion != null)
                         {
-                            ShowFriendlyError(Localization.Get("PleaseWait"), Localization.Get("PleaseWaitMessage"));
-                            return;
-                        }
-
-                        var confirmResult = MessageBox.Show(
-                            Localization.Get("ReplaceExistingMessage"),
-                            Localization.Get("ReplaceExisting"),
-                            MessageBoxButton.YesNo,
-                            MessageBoxImage.Question);
-
-                        if (confirmResult == MessageBoxResult.Yes)
-                        {
-                            var removeResult = await RemoveVersion(existingVersion);
-                            if (!removeResult)
+                            if (existingVersion.IsStateChanging)
                             {
-                                ShowFriendlyError(Localization.Get("CouldntRemoveOld"), Localization.Get("CouldntRemoveOldMessage"));
+                                ShowFriendlyError(Localization.Get("PleaseWait"), Localization.Get("PleaseWaitMessage"));
+                                return;
+                            }
+
+                            var confirmResult = MessageBox.Show(
+                                Localization.Get("ReplaceExistingMessage"),
+                                Localization.Get("ReplaceExisting"),
+                                MessageBoxButton.YesNo,
+                                MessageBoxImage.Question);
+
+                            if (confirmResult == MessageBoxResult.Yes)
+                            {
+                                var removeResult = await RemoveVersion(existingVersion);
+                                if (!removeResult)
+                                {
+                                    ShowFriendlyError(Localization.Get("CouldntRemoveOld"), Localization.Get("CouldntRemoveOldMessage"));
+                                    return;
+                                }
+                            }
+                            else
+                            {
                                 return;
                             }
                         }
-                        else
-                        {
-                            return;
-                        }
                     }
-                }
 
-                var extension = Path.GetExtension(openFileDlg.FileName).ToLowerInvariant();
-                PackageType packageType;
-                
-                if (extension == ".msixvc")
-                {
-                    packageType = PackageType.GDK;
-                }
-                else if (extension == ".appx")
-                {
-                    packageType = PackageType.UWP;
-                }
-                else
-                {
-                    ShowFriendlyError(Localization.Get("WrongFileType"), Localization.Format("WrongFileTypeMessage", extension));
-                    return;
-                }
-
-                var versionEntry = _versions.AddEntry(openFileDlg.SafeFileName, directory, packageType);
-                
-                bool success = false;
-
-                if (packageType == PackageType.UWP)
-                {
-                    success = await ExtractAppx(openFileDlg.FileName, directory, versionEntry);
-                }
-                else if (packageType == PackageType.GDK)
-                {
-                    if (!ShowGDKFirstUseWarning())
+                    var extension = Path.GetExtension(openFileDlg.FileName).ToLowerInvariant();
+                    PackageType packageType;
+                    
+                    if (extension == ".msixvc")
                     {
-                        success = false;
+                        packageType = PackageType.GDK;
+                    }
+                    else if (extension == ".appx")
+                    {
+                        packageType = PackageType.UWP;
                     }
                     else
                     {
-                        success = await ExtractMsixvc(openFileDlg.FileName, directory, versionEntry, isPreview: false);
+                        ShowFriendlyError(Localization.Get("WrongFileType"), Localization.Format("WrongFileTypeMessage", extension));
+                        return;
+                    }
+
+                    var versionEntry = _versions.AddEntry(openFileDlg.SafeFileName, directory, packageType);
+                    
+                    // Show visual feedback - switch to My Versions tab and refresh to show new entry
+                    MyVersionsTab.IsChecked = true;
+                    
+                    RefreshVersionLists(); // Creates ViewModels for all versions including the new one
+                    
+                    // Find the ViewModel that was just created for this version
+                    var viewModel = _installedVersions.FirstOrDefault(vm => vm.Version == versionEntry);
+                    if (viewModel != null)
+                    {
+                        // Set state on the actual version object (the ViewModel will reflect this)
+                        versionEntry.StateChangeInfo = new VersionStateChangeInfo(VersionState.Extracting);
+                        versionEntry.StateChangeInfo.Progress = 0;
+                        versionEntry.StateChangeInfo.MaxProgress = 0; // Indeterminate progress
+                    }
+                    
+                    // CRITICAL: Force UI update before starting heavy extraction work
+                    await Dispatcher.Yield(DispatcherPriority.Background);
+                    
+                    bool success = false;
+
+                    if (packageType == PackageType.UWP)
+                    {
+                        success = await ExtractAppx(openFileDlg.FileName, directory, versionEntry);
+                    }
+                    else if (packageType == PackageType.GDK)
+                    {
+                        if (!ShowGDKFirstUseWarning())
+                        {
+                            success = false;
+                        }
+                        else
+                        {
+                            success = await ExtractMsixvc(openFileDlg.FileName, directory, versionEntry, isPreview: false);
+                        }
+                    }
+
+                    if (success)
+                    {
+                        versionEntry.StateChangeInfo = null;
+                        versionEntry.UpdateInstallStatus();
+                        ShowFriendlySuccess(Localization.Get("VersionAdded"), Localization.Format("VersionAddedMessage", versionEntry.DisplayName));
+                    }
+                    else
+                    {
+                        _versions.Remove(versionEntry);
                     }
                 }
-
-                if (success)
-                {
-                    versionEntry.StateChangeInfo = null;
-                    versionEntry.UpdateInstallStatus();
-                    ShowFriendlySuccess(Localization.Get("VersionAdded"), Localization.Format("VersionAddedMessage", versionEntry.DisplayName));
-                    MyVersionsTab.IsChecked = true;
-                }
-                else
-                {
-                    _versions.Remove(versionEntry);
-                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Import failed with error:\n\n{ex.Message}", "Import Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                _hasImportTask = false;
             }
         }
 
@@ -1030,6 +1415,11 @@ namespace MCLauncher
         }
 
         private void ShowFriendlySuccess(string title, string message)
+        {
+            MessageBox.Show(message, title, MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        
+        private void ShowFriendlyInfo(string title, string message)
         {
             MessageBox.Show(message, title, MessageBoxButton.OK, MessageBoxImage.Information);
         }
@@ -1057,14 +1447,980 @@ namespace MCLauncher
 
         private void RewritePrefs()
         {
-            File.WriteAllText(PREFS_PATH, JsonConvert.SerializeObject(UserPrefs, Formatting.Indented));
+            // CRITICAL: Lock to prevent concurrent writes corrupting preferences.json
+            lock (_prefsLock) {
+                File.WriteAllText(PREFS_PATH, JsonConvert.SerializeObject(UserPrefs, Formatting.Indented));
+            }
+        }
+        
+        // Update download indicator in title bar
+        private void UpdateDownloadIndicator()
+        {
+            Dispatcher.Invoke(() =>
+            {
+                int count = _activeDownloads.Count;
+                if (count > 0)
+                {
+                    DownloadIndicator.Visibility = Visibility.Visible;
+                    DownloadCountText.Text = count.ToString();
+                }
+                else
+                {
+                    DownloadIndicator.Visibility = Visibility.Collapsed;
+                }
+            });
+        }
+        
+        private void DownloadIndicator_Click(object sender, MouseButtonEventArgs e)
+        {
+            // Show popup with currently downloading versions
+            ShowActiveDownloadsDialog();
+        }
+        
+        private void ShowActiveDownloadsDialog()
+        {
+            // If dialog already open, just bring it to front
+            if (_activeDownloadsDialog != null && _activeDownloadsDialog.IsVisible)
+            {
+                _activeDownloadsDialog.Activate();
+                return;
+            }
+            
+            var dialog = new Window
+            {
+                Title = Localization.Get("ActiveDownloads"),
+                Width = 750,
+                Height = 550,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Owner = this,
+                Background = Brushes.Transparent,
+                WindowStyle = WindowStyle.None,
+                AllowsTransparency = true,
+                ResizeMode = ResizeMode.NoResize
+            };
+            
+            _activeDownloadsDialog = dialog;
+
+            var mainBorder = new Border
+            {
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#152818")),
+                BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                BorderThickness = new Thickness(2),
+                CornerRadius = new CornerRadius(16)
+            };
+
+            var grid = new Grid { Margin = new Thickness(24) };
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            // Header with close button
+            var headerGrid = new Grid { Margin = new Thickness(0, 0, 0, 20) };
+            headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var titleText = new TextBlock
+            {
+                Text = "📥 " + Localization.Get("ActiveDownloads"),
+                FontSize = 24,
+                FontWeight = FontWeights.Bold,
+                Foreground = Brushes.White,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(titleText, 0);
+            headerGrid.Children.Add(titleText);
+
+            // Close button (X)
+            var closeButtonTop = new Button
+            {
+                Content = "✕",
+                Width = 32,
+                Height = 32,
+                Background = Brushes.Transparent,
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#A0B5A3")),
+                BorderThickness = new Thickness(0),
+                FontSize = 20,
+                FontWeight = FontWeights.Bold,
+                Cursor = Cursors.Hand,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            closeButtonTop.Click += (s, args) => {
+                StopDownloadDialogUpdates();
+                dialog.Close();
+            };
+            
+            var closeButtonTopTemplate = new ControlTemplate(typeof(Button));
+            var closeButtonBorder = new FrameworkElementFactory(typeof(Border));
+            closeButtonBorder.Name = "border";
+            closeButtonBorder.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Button.BackgroundProperty));
+            closeButtonBorder.SetValue(Border.CornerRadiusProperty, new CornerRadius(6));
+            closeButtonBorder.SetValue(Border.PaddingProperty, new TemplateBindingExtension(Button.PaddingProperty));
+            
+            var contentPresenter = new FrameworkElementFactory(typeof(ContentPresenter));
+            contentPresenter.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+            contentPresenter.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+            closeButtonBorder.AppendChild(contentPresenter);
+            
+            closeButtonTopTemplate.VisualTree = closeButtonBorder;
+            
+            var hoverTrigger = new Trigger { Property = Button.IsMouseOverProperty, Value = true };
+            hoverTrigger.Setters.Add(new Setter(Border.BackgroundProperty, new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1D3520")), "border"));
+            closeButtonTopTemplate.Triggers.Add(hoverTrigger);
+            
+            closeButtonTop.Template = closeButtonTopTemplate;
+            
+            Grid.SetColumn(closeButtonTop, 1);
+            headerGrid.Children.Add(closeButtonTop);
+
+            Grid.SetRow(headerGrid, 0);
+            grid.Children.Add(headerGrid);
+
+            // Downloads list with custom scrollbar
+            var scrollViewer = new ScrollViewer
+            {
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#0D1B0F")),
+                BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(12)
+            };
+            Grid.SetRow(scrollViewer, 1);
+
+            var downloadsPanel = new StackPanel();
+            downloadsPanel.Name = "DownloadsPanel"; // Name it so we can find it later
+            scrollViewer.Content = downloadsPanel;
+            grid.Children.Add(scrollViewer);
+
+            // Bottom button panel
+            var bottomButtonPanel = new StackPanel 
+            { 
+                Orientation = Orientation.Horizontal, 
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 20, 0, 0)
+            };
+            
+            var closeButton = new Button
+            {
+                Content = "✓ " + Localization.Get("Close"),
+                Width = 120,
+                Height = 40,
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                Foreground = Brushes.White,
+                BorderThickness = new Thickness(0),
+                FontSize = 14,
+                FontWeight = FontWeights.Bold,
+                Cursor = Cursors.Hand
+            };
+            closeButton.Click += (s, args) => {
+                StopDownloadDialogUpdates();
+                dialog.Close();
+            };
+            
+            var closeButtonTemplate = new ControlTemplate(typeof(Button));
+            var closeBorder = new FrameworkElementFactory(typeof(Border));
+            closeBorder.Name = "border";
+            closeBorder.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Button.BackgroundProperty));
+            closeBorder.SetValue(Border.CornerRadiusProperty, new CornerRadius(10));
+            closeBorder.SetValue(Border.PaddingProperty, new TemplateBindingExtension(Button.PaddingProperty));
+            
+            var closeContent = new FrameworkElementFactory(typeof(ContentPresenter));
+            closeContent.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+            closeContent.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+            closeBorder.AppendChild(closeContent);
+            
+            closeButtonTemplate.VisualTree = closeBorder;
+            
+            var closeHoverTrigger = new Trigger { Property = Button.IsMouseOverProperty, Value = true };
+            closeHoverTrigger.Setters.Add(new Setter(Border.BackgroundProperty, new SolidColorBrush((Color)ColorConverter.ConvertFromString("#2A8534")), "border"));
+            closeButtonTemplate.Triggers.Add(closeHoverTrigger);
+            
+            closeButton.Template = closeButtonTemplate;
+            
+            bottomButtonPanel.Children.Add(closeButton);
+            Grid.SetRow(bottomButtonPanel, 2);
+            grid.Children.Add(bottomButtonPanel);
+
+            mainBorder.Child = grid;
+            dialog.Content = mainBorder;
+            
+            // Allow dragging the window
+            mainBorder.MouseLeftButtonDown += (s, e) => { if (e.ClickCount == 1) dialog.DragMove(); };
+            
+            // Handle dialog closing
+            dialog.Closed += (s, e) => {
+                StopDownloadDialogUpdates();
+                _activeDownloadsDialog = null;
+            };
+            
+            // Initial population
+            UpdateDownloadDialogContent(downloadsPanel);
+            
+            // Start live updates timer (updates every 500ms)
+            StartDownloadDialogUpdates(downloadsPanel);
+            
+            dialog.Show();
+        }
+        
+        private void StartDownloadDialogUpdates(StackPanel downloadsPanel)
+        {
+            if (_downloadDialogUpdateTimer != null)
+            {
+                _downloadDialogUpdateTimer.Stop();
+                _downloadDialogUpdateTimer = null;
+            }
+            
+            _downloadDialogUpdateTimer = new System.Windows.Threading.DispatcherTimer();
+            _downloadDialogUpdateTimer.Interval = TimeSpan.FromMilliseconds(500);
+            _downloadDialogUpdateTimer.Tick += (s, e) => UpdateDownloadDialogContent(downloadsPanel);
+            _downloadDialogUpdateTimer.Start();
+        }
+        
+        private void StopDownloadDialogUpdates()
+        {
+            if (_downloadDialogUpdateTimer != null)
+            {
+                _downloadDialogUpdateTimer.Stop();
+                _downloadDialogUpdateTimer = null;
+            }
+        }
+        
+        private void UpdateDownloadDialogContent(StackPanel downloadsPanel)
+        {
+            if (downloadsPanel == null) return;
+            
+            downloadsPanel.Children.Clear();
+            
+            lock (_downloadLock)
+            {
+                if (_activeDownloads.Count == 0)
+                {
+                    var emptyText = new TextBlock
+                    {
+                        Text = "📭 " + Localization.Get("NoActiveDownloads"),
+                        FontSize = 16,
+                        Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#A0B5A3")),
+                        TextAlignment = TextAlignment.Center,
+                        Margin = new Thickness(0, 80, 0, 0)
+                    };
+                    downloadsPanel.Children.Add(emptyText);
+                }
+                else
+                {
+                    foreach (var version in _activeDownloads.ToList())
+                    {
+                        var card = new Border
+                        {
+                            Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#152818")),
+                            BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                            BorderThickness = new Thickness(1),
+                            CornerRadius = new CornerRadius(12),
+                            Padding = new Thickness(20),
+                            Margin = new Thickness(0, 0, 0, 12)
+                        };
+
+                        var cardGrid = new Grid();
+                        cardGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                        cardGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                        cardGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                        cardGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+                        // Version name with icon
+                        var namePanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+                        
+                        var iconText = new TextBlock
+                        {
+                            Text = version.VersionType == VersionType.Preview ? "✨" : "⭐",
+                            FontSize = 18,
+                            VerticalAlignment = VerticalAlignment.Center,
+                            Margin = new Thickness(0, 0, 8, 0)
+                        };
+                        namePanel.Children.Add(iconText);
+                        
+                        var nameText = new TextBlock
+                        {
+                            Text = version.DisplayName,
+                            FontSize = 18,
+                            FontWeight = FontWeights.Bold,
+                            Foreground = Brushes.White,
+                            VerticalAlignment = VerticalAlignment.Center
+                        };
+                        namePanel.Children.Add(nameText);
+                        
+                        Grid.SetRow(namePanel, 0);
+                        cardGrid.Children.Add(namePanel);
+
+                        // Progress info (with proper RTL support for Arabic)
+                        if (version.StateChangeInfo != null)
+                        {
+                            var progressText = new TextBlock
+                            {
+                                Text = version.StateChangeInfo.DisplayStatus,
+                                FontSize = 14,
+                                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#00D4FF")),
+                                Margin = new Thickness(0, 0, 0, 10),
+                                FlowDirection = Localization.GetCurrentLanguage() == "ar" ? FlowDirection.RightToLeft : FlowDirection.LeftToRight
+                            };
+                            Grid.SetRow(progressText, 1);
+                            cardGrid.Children.Add(progressText);
+
+                            // Progress bar
+                            var progressBar = new System.Windows.Controls.ProgressBar
+                            {
+                                Height = 8,
+                                Minimum = 0,
+                                Maximum = version.StateChangeInfo.MaxProgress > 0 ? version.StateChangeInfo.MaxProgress : 100,
+                                Value = version.StateChangeInfo.Progress,
+                                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#0D1B0F")),
+                                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                                BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                                BorderThickness = new Thickness(1),
+                                IsIndeterminate = version.StateChangeInfo.IsProgressIndeterminate,
+                                Margin = new Thickness(0, 0, 0, 12)
+                            };
+                            Grid.SetRow(progressBar, 2);
+                            cardGrid.Children.Add(progressBar);
+                            
+                            // Action buttons
+                            var buttonPanel = new StackPanel 
+                            { 
+                                Orientation = Orientation.Horizontal,
+                                HorizontalAlignment = HorizontalAlignment.Right
+                            };
+                            
+                            // Pause/Resume button
+                            var pauseButton = new Button
+                            {
+                                Content = version.StateChangeInfo.IsPaused ? Localization.Get("Resume") : Localization.Get("Pause"),
+                                Height = 32,
+                                Padding = new Thickness(16, 0, 16, 0),
+                                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#F59E0B")),
+                                Foreground = Brushes.White,
+                                BorderThickness = new Thickness(0),
+                                FontSize = 13,
+                                FontWeight = FontWeights.SemiBold,
+                                Cursor = Cursors.Hand,
+                                Margin = new Thickness(0, 0, 8, 0)
+                            };
+                            pauseButton.Click += (s, args) => InvokePauseResume(version);
+                            
+                            var pauseTemplate = new ControlTemplate(typeof(Button));
+                            var pauseBorder = new FrameworkElementFactory(typeof(Border));
+                            pauseBorder.Name = "border";
+                            pauseBorder.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Button.BackgroundProperty));
+                            pauseBorder.SetValue(Border.CornerRadiusProperty, new CornerRadius(8));
+                            pauseBorder.SetValue(Border.PaddingProperty, new TemplateBindingExtension(Button.PaddingProperty));
+                            var pauseContent = new FrameworkElementFactory(typeof(ContentPresenter));
+                            pauseContent.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+                            pauseContent.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+                            pauseBorder.AppendChild(pauseContent);
+                            pauseTemplate.VisualTree = pauseBorder;
+                            var pauseHover = new Trigger { Property = Button.IsMouseOverProperty, Value = true };
+                            pauseHover.Setters.Add(new Setter(Border.BackgroundProperty, new SolidColorBrush((Color)ColorConverter.ConvertFromString("#D97706")), "border"));
+                            pauseTemplate.Triggers.Add(pauseHover);
+                            pauseButton.Template = pauseTemplate;
+                            
+                            buttonPanel.Children.Add(pauseButton);
+                            
+                            // Cancel button
+                            var cancelButton = new Button
+                            {
+                                Content = Localization.Get("Cancel"),
+                                Height = 32,
+                                Padding = new Thickness(16, 0, 16, 0),
+                                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FF3B5C")),
+                                Foreground = Brushes.White,
+                                BorderThickness = new Thickness(0),
+                                FontSize = 13,
+                                FontWeight = FontWeights.SemiBold,
+                                Cursor = Cursors.Hand
+                            };
+                            cancelButton.Click += (s, args) => 
+                            {
+                                if (version.StateChangeInfo?.CancelCommand != null)
+                                {
+                                    version.StateChangeInfo.CancelCommand.Execute(null);
+                                }
+                            };
+                            
+                            var cancelTemplate = new ControlTemplate(typeof(Button));
+                            var cancelBorder = new FrameworkElementFactory(typeof(Border));
+                            cancelBorder.Name = "border";
+                            cancelBorder.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Button.BackgroundProperty));
+                            cancelBorder.SetValue(Border.CornerRadiusProperty, new CornerRadius(8));
+                            cancelBorder.SetValue(Border.PaddingProperty, new TemplateBindingExtension(Button.PaddingProperty));
+                            var cancelContent = new FrameworkElementFactory(typeof(ContentPresenter));
+                            cancelContent.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+                            cancelContent.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+                            cancelBorder.AppendChild(cancelContent);
+                            cancelTemplate.VisualTree = cancelBorder;
+                            var cancelHover = new Trigger { Property = Button.IsMouseOverProperty, Value = true };
+                            cancelHover.Setters.Add(new Setter(Border.BackgroundProperty, new SolidColorBrush((Color)ColorConverter.ConvertFromString("#DC2626")), "border"));
+                            cancelTemplate.Triggers.Add(cancelHover);
+                            cancelButton.Template = cancelTemplate;
+                            
+                            buttonPanel.Children.Add(cancelButton);
+                            
+                            Grid.SetRow(buttonPanel, 3);
+                            cardGrid.Children.Add(buttonPanel);
+                        }
+
+                        card.Child = cardGrid;
+                        downloadsPanel.Children.Add(card);
+                    }
+                }
+            }
+        }
+        
+        private void AddActiveDownload(WPFDataTypes.Version v)
+        {
+            lock (_downloadLock)
+            {
+                _activeDownloads.Add(v);
+                UpdateDownloadIndicator();
+            }
+        }
+        
+        private void RemoveActiveDownload(WPFDataTypes.Version v)
+        {
+            lock (_downloadLock)
+            {
+                _activeDownloads.Remove(v);
+                UpdateDownloadIndicator();
+            }
+        }
+
+        // Settings button handler
+        private void SettingsButton_Click(object sender, RoutedEventArgs e)
+        {
+            ShowSettingsDialog();
+        }
+
+        private void ShowSettingsDialog()
+        {
+            var dialog = new Window
+            {
+                Title = Localization.Get("SettingsTitle"),
+                Width = 600,
+                Height = 250,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Owner = this,
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#152818")),
+                WindowStyle = WindowStyle.ToolWindow,
+                ResizeMode = ResizeMode.NoResize
+            };
+
+            var grid = new Grid { Margin = new Thickness(20) };
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(20) });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            // Title
+            var titleText = new TextBlock
+            {
+                Text = Localization.Get("LauncherSettings"),
+                FontSize = 20,
+                FontWeight = FontWeights.Bold,
+                Foreground = Brushes.White,
+                Margin = new Thickness(0, 0, 0, 10)
+            };
+            Grid.SetRow(titleText, 0);
+            grid.Children.Add(titleText);
+
+            // Data path section
+            var pathLabel = new TextBlock
+            {
+                Text = Localization.Get("LauncherDataPath"),
+                FontSize = 14,
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#A0B5A3")),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetRow(pathLabel, 2);
+            grid.Children.Add(pathLabel);
+
+            var pathPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
+            Grid.SetRow(pathPanel, 3);
+
+            var pathTextBox = new TextBox
+            {
+                Text = string.IsNullOrEmpty(UserPrefs.LauncherDataPath) 
+                    ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MinecraftVersionLauncher")
+                    : UserPrefs.LauncherDataPath,
+                Width = 400,
+                Height = 32,
+                Padding = new Thickness(8),
+                FontSize = 12,
+                IsReadOnly = false,
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#0D1B0F")),
+                Foreground = Brushes.White,
+                BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                BorderThickness = new Thickness(1),
+                VerticalContentAlignment = VerticalAlignment.Center,
+                AcceptsReturn = false,
+                TextWrapping = TextWrapping.NoWrap
+            };
+
+            var browseButton = new Button
+            {
+                Content = Localization.Get("Browse"),
+                Width = 100,
+                Height = 32,
+                Margin = new Thickness(10, 0, 0, 0),
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                Foreground = Brushes.White,
+                BorderThickness = new Thickness(0),
+                FontWeight = FontWeights.SemiBold,
+                Cursor = Cursors.Hand
+            };
+
+            browseButton.Click += (s, args) =>
+            {
+                var folderDialog = new System.Windows.Forms.FolderBrowserDialog
+                {
+                    Description = Localization.Get("SelectLauncherDataFolder"),
+                    ShowNewFolderButton = true
+                };
+
+                if (folderDialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+                {
+                    string newPath = folderDialog.SelectedPath;
+                    pathTextBox.Text = newPath;
+                }
+            };
+
+            pathPanel.Children.Add(pathTextBox);
+            pathPanel.Children.Add(browseButton);
+            grid.Children.Add(pathPanel);
+
+            // Buttons
+            var buttonPanel = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 20, 0, 0) };
+            Grid.SetRow(buttonPanel, 4);
+
+            var cancelButton = new Button
+            {
+                Content = Localization.Get("Cancel"),
+                Width = 100,
+                Height = 36,
+                Margin = new Thickness(0, 0, 10, 0),
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1D3520")),
+                Foreground = Brushes.White,
+                BorderThickness = new Thickness(0),
+                FontWeight = FontWeights.SemiBold,
+                Cursor = Cursors.Hand
+            };
+            cancelButton.Click += (s, args) => dialog.Close();
+
+            var saveButton = new Button
+            {
+                Content = Localization.Get("Save"),
+                Width = 100,
+                Height = 36,
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                Foreground = Brushes.White,
+                BorderThickness = new Thickness(0),
+                FontWeight = FontWeights.Bold,
+                Cursor = Cursors.Hand
+            };
+
+            saveButton.Click += async (s, args) =>
+            {
+                string newPath = pathTextBox.Text.Trim();
+                
+                // Validate path
+                if (string.IsNullOrWhiteSpace(newPath))
+                {
+                    MessageBox.Show(
+                        Localization.Get("PleaseEnterValidPath"),
+                        Localization.Get("InvalidPath"),
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    return;
+                }
+                
+                // Check if path contains invalid characters
+                try
+                {
+                    Path.GetFullPath(newPath); // This will throw if path is invalid
+                }
+                catch
+                {
+                    MessageBox.Show(
+                        Localization.Get("PathContainsInvalidChars"),
+                        Localization.Get("InvalidPath"),
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    return;
+                }
+                
+                string currentPath = string.IsNullOrEmpty(UserPrefs.LauncherDataPath)
+                    ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MinecraftVersionLauncher")
+                    : UserPrefs.LauncherDataPath;
+
+                if (newPath != currentPath)
+                {
+                    var result = MessageBox.Show(
+                        Localization.Format("ConfirmMoveMessage", currentPath, newPath),
+                        Localization.Get("ConfirmDataPathChange"),
+                        MessageBoxButton.YesNo,
+                        MessageBoxImage.Warning);
+
+                    if (result == MessageBoxResult.Yes)
+                    {
+                        dialog.Close();
+                        await MoveLauncherDataAsync(currentPath, newPath);
+                    }
+                }
+                else
+                {
+                    dialog.Close();
+                }
+            };
+
+            buttonPanel.Children.Add(cancelButton);
+            buttonPanel.Children.Add(saveButton);
+            grid.Children.Add(buttonPanel);
+
+            dialog.Content = grid;
+            dialog.ShowDialog();
+        }
+
+        private async Task MoveLauncherDataAsync(string oldPath, string newPath)
+        {
+            Window progressDialog = null;
+            TextBlock progressText = null;
+            TextBlock percentText = null;
+            System.Windows.Controls.ProgressBar progressBar = null;
+            
+            // Declare at method level to avoid scope conflicts
+            string defaultLauncherPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "MinecraftVersionLauncher");
+            
+            try
+            {
+                // Normalize paths for comparison
+                oldPath = Path.GetFullPath(oldPath);
+                newPath = Path.GetFullPath(newPath);
+                
+                // Check if paths are the same
+                if (string.Equals(oldPath, newPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    MessageBox.Show(
+                        "Source and destination paths are the same.",
+                        "No Changes Needed",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                    return;
+                }
+                
+                // Create progress dialog with better UI
+                progressDialog = new Window
+                {
+                    Title = "Moving Data",
+                    Width = 450,
+                    Height = 200,
+                    WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                    Owner = this,
+                    Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#152818")),
+                    WindowStyle = WindowStyle.None,
+                    ResizeMode = ResizeMode.NoResize,
+                    AllowsTransparency = true
+                };
+
+                var progressGrid = new Grid { Margin = new Thickness(30) };
+                progressGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                progressGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(20) });
+                progressGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                progressGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(10) });
+                progressGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                
+                progressText = new TextBlock
+                {
+                    Text = "Preparing to move data...",
+                    FontSize = 14,
+                    Foreground = Brushes.White,
+                    TextAlignment = TextAlignment.Center,
+                    HorizontalAlignment = HorizontalAlignment.Center
+                };
+                Grid.SetRow(progressText, 0);
+                
+                percentText = new TextBlock
+                {
+                    Text = "0%",
+                    FontSize = 20,
+                    FontWeight = FontWeights.Bold,
+                    Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#00D4FF")),
+                    TextAlignment = TextAlignment.Center,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    Margin = new Thickness(0, 10, 0, 0)
+                };
+                Grid.SetRow(percentText, 2);
+                
+                progressBar = new System.Windows.Controls.ProgressBar
+                {
+                    Height = 8,
+                    Minimum = 0,
+                    Maximum = 100,
+                    Value = 0,
+                    Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#0D1B0F")),
+                    Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#00D4FF")),
+                    BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#216C2A")),
+                    BorderThickness = new Thickness(1)
+                };
+                Grid.SetRow(progressBar, 4);
+                
+                progressGrid.Children.Add(progressText);
+                progressGrid.Children.Add(percentText);
+                progressGrid.Children.Add(progressBar);
+                progressDialog.Content = progressGrid;
+                progressDialog.Show();
+
+                await Task.Run(() =>
+                {
+                    // Create new directory if it doesn't exist
+                    if (!Directory.Exists(newPath))
+                    {
+                        Directory.CreateDirectory(newPath);
+                    }
+
+                    // Count total files for progress tracking
+                    Dispatcher.Invoke(() => progressText.Text = "Counting files...");
+                    
+                    var allFiles = Directory.GetFiles(oldPath, "*.*", SearchOption.AllDirectories).ToList();
+                    int totalFiles = allFiles.Count;
+                    int processedFiles = 0;
+
+                    // Create directory structure
+                    Dispatcher.Invoke(() => progressText.Text = "Creating directories...");
+                    foreach (string dirPath in Directory.GetDirectories(oldPath, "*", SearchOption.AllDirectories))
+                    {
+                        Directory.CreateDirectory(dirPath.Replace(oldPath, newPath));
+                    }
+
+                    // Copy all files with progress
+                    foreach (string filePath in allFiles)
+                    {
+                        string fileName = Path.GetFileName(filePath);
+                        Dispatcher.Invoke(() => progressText.Text = $"Copying: {fileName}");
+                        
+                        string newFilePath = filePath.Replace(oldPath, newPath);
+                        File.Copy(filePath, newFilePath, true);
+                        
+                        processedFiles++;
+                        int percent = (int)((processedFiles / (double)totalFiles) * 100);
+                        Dispatcher.Invoke(() =>
+                        {
+                            progressBar.Value = percent;
+                            percentText.Text = $"{percent}%";
+                        });
+                    }
+                    
+                    // Update preferences and save to NEW location BEFORE deleting old
+                    Dispatcher.Invoke(() => progressText.Text = "Updating configuration...");
+                    UserPrefs.LauncherDataPath = newPath;
+                    string newPrefsPath = Path.Combine(newPath, "preferences.json");
+                    File.WriteAllText(newPrefsPath, JsonConvert.SerializeObject(UserPrefs, Formatting.Indented));
+                    
+                    // Create redirect file in OLD location pointing to NEW location
+                    // Only create redirect if we're moving FROM the default location
+                    if (string.Equals(oldPath, defaultLauncherPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Ensure default directory exists
+                        if (!Directory.Exists(defaultLauncherPath))
+                        {
+                            Directory.CreateDirectory(defaultLauncherPath);
+                        }
+                        
+                        // Create redirect file
+                        string redirectFile = Path.Combine(defaultLauncherPath, "MOVED_TO.txt");
+                        File.WriteAllText(redirectFile, $"Launcher data has been moved to:\n{newPath}\n\nThis file is used by the launcher to find the new location.");
+                        
+                        // Also save a minimal preferences file with just the path
+                        string redirectPrefs = Path.Combine(defaultLauncherPath, "preferences.json");
+                        var redirectPrefsObj = new Preferences { LauncherDataPath = newPath };
+                        File.WriteAllText(redirectPrefs, JsonConvert.SerializeObject(redirectPrefsObj, Formatting.Indented));
+                    }
+                });
+
+                Dispatcher.Invoke(() =>
+                {
+                    progressDialog.Close();
+                    progressDialog = null;
+                });
+
+                // Show success message
+                MessageBox.Show(
+                    Localization.Get("DataMovedSuccessfully"),
+                    Localization.Get("Success"),
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+
+                // Create a batch script to delete old directory after app closes and restart
+                string batchPath = Path.Combine(Path.GetTempPath(), "cleanup_launcher.bat");
+                string exePath = Process.GetCurrentProcess().MainModule.FileName;
+                
+                StringBuilder batchContent = new StringBuilder();
+                batchContent.AppendLine("@echo off");
+                batchContent.AppendLine("timeout /t 2 /nobreak > nul");
+                
+                // Only delete old directory if it's NOT the default location (we keep redirect there)
+                if (!string.Equals(oldPath, defaultLauncherPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    batchContent.AppendLine($"rd /s /q \"{oldPath}\" 2>nul");
+                }
+                else
+                {
+                    // If it's the default location, delete everything EXCEPT the redirect files
+                    batchContent.AppendLine($"cd /d \"{oldPath}\"");
+                    batchContent.AppendLine("for /d %%D in (*) do rd /s /q \"%%D\" 2>nul");
+                    batchContent.AppendLine("for %%F in (*) do (");
+                    batchContent.AppendLine("  if /i not \"%%F\"==\"MOVED_TO.txt\" (");
+                    batchContent.AppendLine("    if /i not \"%%F\"==\"preferences.json\" (");
+                    batchContent.AppendLine("      del \"%%F\" 2>nul");
+                    batchContent.AppendLine("    )");
+                    batchContent.AppendLine("  )");
+                    batchContent.AppendLine(")");
+                }
+                
+                batchContent.AppendLine($"start \"\" \"{exePath}\"");
+                batchContent.AppendLine("del \"%~f0\"");
+                
+                File.WriteAllText(batchPath, batchContent.ToString());
+                
+                // Start the batch script and exit
+                try
+                {
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = batchPath,
+                        CreateNoWindow = true,
+                        UseShellExecute = true,
+                        WindowStyle = ProcessWindowStyle.Hidden
+                    });
+                }
+                catch (Exception batchEx)
+                {
+                    Debug.WriteLine($"Failed to start cleanup batch: {batchEx}");
+                }
+                
+                Application.Current.Shutdown();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Failed to move launcher data: {ex}");
+                
+                if (progressDialog != null)
+                {
+                    Dispatcher.Invoke(() => progressDialog.Close());
+                }
+                
+                MessageBox.Show(
+                    $"Failed to move launcher data:\n\n{ex.Message}\n\nThe old location has been preserved.",
+                    "Error",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        }
+
+        // CRITICAL: Helper to check if any version is in a package management state that blocks ALL operations
+        private bool IsAnyVersionInCriticalState() {
+            return _versions.Any(ver => 
+                ver.StateChangeInfo?.VersionState == VersionState.Staging ||
+                ver.StateChangeInfo?.VersionState == VersionState.Unregistering ||
+                ver.StateChangeInfo?.VersionState == VersionState.Registering);
         }
 
         // ICommonVersionCommands implementation
-        public ICommand LaunchCommand => new RelayCommand((v) => InvokeLaunch((WPFDataTypes.Version)v));
-        public ICommand RemoveCommand => new RelayCommand((v) => InvokeRemove((WPFDataTypes.Version)v));
-        public ICommand DownloadCommand => new RelayCommand((v) => InvokeDownload((WPFDataTypes.Version)v));
-        public ICommand PauseResumeCommand => new RelayCommand((v) => InvokePauseResume((WPFDataTypes.Version)v));
+        public ICommand LaunchCommand => new RelayCommand(
+            (v) => InvokeLaunch((WPFDataTypes.Version)v),
+            (v) => {
+                var version = v as WPFDataTypes.Version;
+                // CRITICAL: Disable launch when:
+                // 1. Version is not installed
+                // 2. This version is in a state change
+                // 3. ANY version is in critical package management state (staging/unregistering/registering)
+                return version != null && version.IsInstalled && !version.IsStateChanging && !IsAnyVersionInCriticalState();
+            }
+        );
+        public ICommand RemoveCommand => new RelayCommand(
+            (v) => InvokeRemove((WPFDataTypes.Version)v),
+            (v) => {
+                var version = v as WPFDataTypes.Version;
+                // CRITICAL: Disable remove during state changes OR critical package operations
+                return version != null && !version.IsStateChanging && !IsAnyVersionInCriticalState();
+            }
+        );
+        public ICommand DownloadCommand => new RelayCommand(
+            (v) => InvokeDownload((WPFDataTypes.Version)v),
+            (v) => {
+                var version = v as WPFDataTypes.Version;
+                // CRITICAL: Disable download during state changes (except when paused) OR critical package operations
+                return version != null && (!version.IsStateChanging || (version.StateChangeInfo?.IsPaused == true)) && !IsAnyVersionInCriticalState();
+            }
+        );
+        public ICommand PauseResumeCommand => new RelayCommand(
+            (v) => InvokePauseResume((WPFDataTypes.Version)v),
+            (v) => {
+                var version = v as WPFDataTypes.Version;
+                // Only enabled during download state AND no critical operations
+                return version != null && version.IsStateChanging && 
+                       (version.StateChangeInfo?.VersionState == VersionState.Downloading || 
+                        version.StateChangeInfo?.VersionState == VersionState.Initializing) &&
+                       !IsAnyVersionInCriticalState();
+            }
+        );
+        public ICommand UnlockCommand => new RelayCommand(
+            (v) => InvokeUnlock((WPFDataTypes.Version)v),
+            (v) => {
+                var version = v as WPFDataTypes.Version;
+                // CRITICAL: Disable unlock during state changes OR critical package operations
+                return version != null && version.IsInstalled && !version.IsStateChanging && !IsAnyVersionInCriticalState();
+            }
+        );
+
+        private void InvokeUnlock(WPFDataTypes.Version v)
+        {
+            if (v == null || !v.IsInstalled)
+                return;
+            
+            string gameDir = Path.GetFullPath(v.GameDirectory);
+            
+            // Check if already unlocked
+            if (BfixInjector.IsAlreadyUnlocked(gameDir))
+            {
+                ShowFriendlyInfo(
+                    Localization.Get("AlreadyUnlocked"),
+                    Localization.Format("AlreadyUnlockedMessage", v.DisplayName));
+                return;
+            }
+            
+            // Show confirmation dialog
+            var result = MessageBox.Show(
+                Localization.Get("UnlockConfirmMessage"),
+                Localization.Get("UnlockConfirmTitle"),
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+            
+            if (result == MessageBoxResult.Yes)
+            {
+                try
+                {
+                    BfixInjector.InjectToMinecraft(gameDir);
+                    ShowFriendlySuccess(
+                        Localization.Get("UnlockSuccess"),
+                        Localization.Format("UnlockSuccessMessage", v.DisplayName));
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Unlock failed: {ex}");
+                    ShowFriendlyError(
+                        Localization.Get("Error"),
+                        $"Failed to unlock version:\n\n{ex.Message}");
+                }
+            }
+        }
 
         private void InvokePauseResume(WPFDataTypes.Version v)
         {
@@ -1073,9 +2429,9 @@ namespace MCLauncher
 
             if (v.StateChangeInfo.IsPaused)
             {
-                // Resume download
+                // Resume download - DON'T modify state here, let InvokeDownload handle it
+                // Just clear the paused flag so InvokeDownload knows this is a resume
                 Debug.WriteLine("Resuming download for: " + v.DisplayName);
-                v.StateChangeInfo.IsPaused = false;
                 InvokeDownload(v);
             }
             else
@@ -1116,6 +2472,9 @@ namespace MCLauncher
 
                     v.StateChangeInfo = new VersionStateChangeInfo(VersionState.Registering);
                     string gameDir = Path.GetFullPath(v.GameDirectory);
+                    
+                    // Bfix injection is now manual via unlock button
+                    
                     try
                     {
                         await ReRegisterPackage(v.GamePackageFamily, gameDir, v);
@@ -1138,11 +2497,11 @@ namespace MCLauncher
                     {
                         if (v.PackageType == PackageType.GDK)
                         {
-                            await Task.Run(() => 
-                            {
-                                var psi = new ProcessStartInfo
+                            await Task.Run(() => {
+                                string exePath = Path.Combine(gameDir, "Minecraft.Windows.exe");
+                                ProcessStartInfo psi = new ProcessStartInfo
                                 {
-                                    FileName = Path.Combine(gameDir, "Minecraft.Windows.exe"),
+                                    FileName = exePath,
                                     WorkingDirectory = gameDir,
                                     UseShellExecute = false
                                 };
@@ -1171,11 +2530,9 @@ namespace MCLauncher
                         }
                         Debug.WriteLine("App launch finished!");
                         
-                        Dispatcher.Invoke(() =>
-                        {
-                            ShowFriendlySuccess(Localization.Get("MinecraftStarting"),
-                                Localization.Format("MinecraftStartingMessage", v.DisplayName));
-                        });
+                        // Track this version as running
+                        _runningVersion = v;
+                        SaveRunningVersion(v);
                     }
                     catch (Exception e)
                     {
@@ -1193,6 +2550,510 @@ namespace MCLauncher
                     v.StateChangeInfo = null;
                 }
             });
+        }
+        
+        // Save running version info to file
+        private void SaveRunningVersion(WPFDataTypes.Version v)
+        {
+            try
+            {
+                var info = new
+                {
+                    VersionName = v.Name,
+                    VersionUUID = v.UUID,
+                    GameDirectory = v.GameDirectory,
+                    PackageFamily = v.GamePackageFamily,
+                    Timestamp = DateTime.Now
+                };
+                File.WriteAllText(RUNNING_VERSION_PATH, JsonConvert.SerializeObject(info, Formatting.Indented));
+                Debug.WriteLine($"Saved running version: {v.Name}");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Failed to save running version: {ex.Message}");
+            }
+        }
+        
+        // Load running version info from file
+        private WPFDataTypes.Version LoadRunningVersion()
+        {
+            try
+            {
+                if (!File.Exists(RUNNING_VERSION_PATH))
+                    return null;
+                
+                var json = File.ReadAllText(RUNNING_VERSION_PATH);
+                var info = JsonConvert.DeserializeObject<dynamic>(json);
+                
+                // Find the version in our list
+                string versionName = info.VersionName;
+                var version = _versions.FirstOrDefault(v => v.Name == versionName);
+                
+                if (version != null)
+                {
+                    Debug.WriteLine($"Loaded running version from file: {version.Name}");
+                    return version;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Failed to load running version: {ex.Message}");
+            }
+            return null;
+        }
+        
+        /// <summary>
+        /// Query the actual installed Minecraft version from Windows AppxPackage system.
+        /// This is more accurate than relying on launcher's registered version tracking.
+        /// Returns the version string (e.g., "1.21.50.7") or null if not found.
+        /// </summary>
+        private string GetSystemInstalledMinecraftVersion(string packageFamily)
+        {
+            try
+            {
+                // Use PackageManager API to query installed packages
+                var packageManager = new Windows.Management.Deployment.PackageManager();
+                var packages = packageManager.FindPackages(packageFamily);
+                
+                foreach (var pkg in packages)
+                {
+                    try
+                    {
+                        // Get version from package identity
+                        var pkgVersion = pkg.Id.Version;
+                        string versionString = $"{pkgVersion.Major}.{pkgVersion.Minor}.{pkgVersion.Build}.{pkgVersion.Revision}";
+                        Debug.WriteLine($"System installed Minecraft version detected: {versionString} (Package: {pkg.Id.FullName})");
+                        return versionString;
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Failed to read package version: {ex.Message}");
+                    }
+                }
+                
+                // Fallback: Try PowerShell query
+                Debug.WriteLine("PackageManager query returned no results, trying PowerShell fallback");
+                return GetSystemInstalledMinecraftVersionViaPowerShell(packageFamily);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"PackageManager query failed: {ex.Message}, trying PowerShell fallback");
+                return GetSystemInstalledMinecraftVersionViaPowerShell(packageFamily);
+            }
+        }
+        
+        /// <summary>
+        /// Fallback method using PowerShell to query Get-AppxPackage.
+        /// More reliable in some edge cases where PackageManager API fails.
+        /// </summary>
+        private string GetSystemInstalledMinecraftVersionViaPowerShell(string packageFamily)
+        {
+            try
+            {
+                // Extract package name from family (e.g., "Microsoft.MinecraftUWP_8wekyb3d8bbwe" -> "Microsoft.MinecraftUWP")
+                string packageName = packageFamily.Split('_')[0];
+                
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = $"-Command \"Get-AppxPackage -Name '{packageName}' | Select-Object -ExpandProperty Version\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,  // CRITICAL: Must redirect stderr when UseShellExecute = false
+                    UseShellExecute = false,
+                    CreateNoWindow = true,  // CRITICAL: Hide the window completely
+                    WindowStyle = ProcessWindowStyle.Hidden  // FIXED: Was Normal, causing visible window every 60s
+                };
+                
+                using (var process = Process.Start(psi))
+                {
+                    string output = process.StandardOutput.ReadToEnd();
+                    string errors = process.StandardError.ReadToEnd();
+                    process.WaitForExit(5000);
+                    
+                    if (!string.IsNullOrWhiteSpace(errors))
+                    {
+                        Debug.WriteLine($"PowerShell stderr: {errors}");
+                    }
+                    
+                    if (!string.IsNullOrWhiteSpace(output))
+                    {
+                        string versionString = output.Trim();
+                        Debug.WriteLine($"PowerShell detected Minecraft version: {versionString}");
+                        return versionString;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"PowerShell version query failed: {ex.Message}");
+            }
+            
+            return null;
+        }
+        
+        /// <summary>
+        /// Determine the best version to auto-select using multiple detection methods.
+        /// Priority: 1) Currently running process, 2) System-installed version, 3) Registered version, 4) Most recent
+        /// </summary>
+        private WPFDataTypes.Version DetermineBestVersionToSelect(List<WPFDataTypes.Version> installedVersions, WPFDataTypes.Version registeredVersion)
+        {
+            if (installedVersions == null || installedVersions.Count == 0)
+                return null;
+            
+            // Priority 1: Check if Minecraft is currently running
+            var runningVersion = DetectRunningMinecraft();
+            if (runningVersion != null && installedVersions.Contains(runningVersion))
+            {
+                Debug.WriteLine($"Auto-selecting currently running version: {runningVersion.Name}");
+                return runningVersion;
+            }
+            
+            // Priority 2: Query system for actually installed Minecraft version
+            foreach (var version in installedVersions)
+            {
+                string systemVersion = GetSystemInstalledMinecraftVersion(version.GamePackageFamily);
+                if (!string.IsNullOrEmpty(systemVersion))
+                {
+                    // Try to match system version to our installed versions
+                    var matchedVersion = installedVersions.FirstOrDefault(v => v.Name == systemVersion);
+                    if (matchedVersion != null)
+                    {
+                        Debug.WriteLine($"Auto-selecting system-installed version: {matchedVersion.Name}");
+                        return matchedVersion;
+                    }
+                    
+                    // If exact match fails, try fuzzy match (version numbers might differ slightly)
+                    var parsedSystemVersion = ParseVersionNumber(systemVersion);
+                    var closestMatch = installedVersions
+                        .Select(v => new { Version = v, Parsed = ParseVersionNumber(v.Name) })
+                        .Where(x => x.Parsed.Major == parsedSystemVersion.Major && 
+                                   x.Parsed.Minor == parsedSystemVersion.Minor)
+                        .OrderByDescending(x => x.Parsed)
+                        .FirstOrDefault();
+                    
+                    if (closestMatch != null)
+                    {
+                        Debug.WriteLine($"Auto-selecting closest match to system version: {closestMatch.Version.Name} (system: {systemVersion})");
+                        return closestMatch.Version;
+                    }
+                }
+            }
+            
+            // Priority 3: Use registered version from launcher tracking
+            if (registeredVersion != null && installedVersions.Contains(registeredVersion))
+            {
+                Debug.WriteLine($"Auto-selecting registered version: {registeredVersion.Name}");
+                return registeredVersion;
+            }
+            
+            // Priority 4: Select most recent version by version number
+            var mostRecent = installedVersions
+                .Select(v => new { Version = v, Parsed = ParseVersionNumber(v.Name) })
+                .OrderByDescending(x => x.Parsed)
+                .FirstOrDefault();
+            
+            if (mostRecent != null)
+            {
+                Debug.WriteLine($"Auto-selecting most recent version: {mostRecent.Version.Name}");
+                return mostRecent.Version;
+            }
+            
+            // Fallback: First in list
+            Debug.WriteLine($"Auto-selecting first version in list: {installedVersions[0].Name}");
+            return installedVersions[0];
+        }
+        
+        // Detect which Minecraft version is currently running
+        private WPFDataTypes.Version DetectRunningMinecraft()
+        {
+            try
+            {
+                // Get current process ID to exclude ourselves
+                int currentProcessId = Process.GetCurrentProcess().Id;
+                
+                // Get ALL running processes
+                var allProcesses = Process.GetProcesses();
+                
+                // Check if any process has "minecraft" in its name (case-insensitive)
+                foreach (var proc in allProcesses)
+                {
+                    try
+                    {
+                        // Skip our own launcher process
+                        if (proc.Id == currentProcessId)
+                            continue;
+                        
+                        string processName = proc.ProcessName.ToLower();
+                        
+                        // Detect any minecraft-related process, but exclude launchers
+                        if (processName.Contains("minecraft") && !processName.Contains("launcher"))
+                        {
+                            Debug.WriteLine($"Detected running Minecraft process: {proc.ProcessName}");
+                            
+                            // Try to match to an installed version
+                            foreach (var version in _versions.Where(v => v.IsInstalled))
+                            {
+                                string gameDir = Path.GetFullPath(version.GameDirectory);
+                                string minecraftExe = Path.Combine(gameDir, "Minecraft.Windows.exe");
+                                
+                                if (!File.Exists(minecraftExe))
+                                    continue;
+                                
+                                try
+                                {
+                                    string procPath = proc.MainModule.FileName;
+                                    if (procPath.Equals(minecraftExe, StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        Debug.WriteLine($"Matched to installed version: {version.Name}");
+                                        return version;
+                                    }
+                                }
+                                catch { }
+                            }
+                            
+                            // Minecraft is running but not from our launcher - return first installed version as marker
+                            Debug.WriteLine("Minecraft is running (external instance)");
+                            var firstVersion = _versions.FirstOrDefault(v => v.IsInstalled);
+                            return firstVersion ?? _versions.FirstOrDefault();
+                        }
+                    }
+                    catch { }
+                }
+                
+                Debug.WriteLine("No Minecraft processes running");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error detecting running Minecraft: {ex.Message}");
+            }
+            return null;
+        }
+        
+        // Kill all Minecraft processes
+        private void KillAllMinecraft()
+        {
+            try
+            {
+                var processes = Process.GetProcessesByName("Minecraft.Windows");
+                foreach (var proc in processes)
+                {
+                    try
+                    {
+                        Debug.WriteLine($"Killing Minecraft process PID {proc.Id}");
+                        proc.Kill();
+                        proc.WaitForExit(5000);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Failed to kill process: {ex.Message}");
+                    }
+                }
+                
+                if (processes.Length > 0)
+                {
+                    Debug.WriteLine($"Killed {processes.Length} Minecraft process(es)");
+                    Thread.Sleep(1000); // Wait for cleanup
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error killing Minecraft: {ex.Message}");
+            }
+        }
+        
+        /// <summary>
+        /// Lightweight timer callback that monitors Minecraft process state.
+        /// Only performs expensive version queries when state changes (start/stop).
+        /// Performance: ~1-3ms per tick (process enumeration only).
+        /// </summary>
+        private void VersionMonitorTimer_Tick(object sender, EventArgs e)
+        {
+            try
+            {
+                // Fast check: Is Minecraft.Windows process running? (~1-3ms)
+                bool isRunning = Process.GetProcessesByName("Minecraft.Windows").Length > 0;
+                
+                // State change detection
+                if (isRunning != _wasMinecraftRunning)
+                {
+                    _wasMinecraftRunning = isRunning;
+                    
+                    if (isRunning)
+                    {
+                        Debug.WriteLine("[Monitor] Minecraft started - querying system version");
+                        
+                        // Minecraft just started - query system version (expensive, but only on state change)
+                        Task.Run(() =>
+                        {
+                            try
+                            {
+                                // Check both UWP and Preview package families
+                                string uwpVersion = GetSystemInstalledMinecraftVersion(MinecraftPackageFamilies.MINECRAFT);
+                                string previewVersion = GetSystemInstalledMinecraftVersion(MinecraftPackageFamilies.MINECRAFT_PREVIEW);
+                                
+                                string detectedVersion = uwpVersion ?? previewVersion;
+                                
+                                if (!string.IsNullOrEmpty(detectedVersion))
+                                {
+                                    _cachedSystemVersion = detectedVersion;
+                                    _lastSystemVersionCheck = DateTime.Now;
+                                    Debug.WriteLine($"[Monitor] System version cached: {detectedVersion}");
+                                    
+                                    // Update _runningVersion if we can match it
+                                    var matchedVersion = _versions.FirstOrDefault(v => v.Name == detectedVersion);
+                                    if (matchedVersion != null)
+                                    {
+                                        _runningVersion = matchedVersion;
+                                        SaveRunningVersion(matchedVersion);
+                                        Debug.WriteLine($"[Monitor] Updated running version to: {matchedVersion.Name}");
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"[Monitor] Version query failed: {ex.Message}");
+                            }
+                        });
+                    }
+                    else
+                    {
+                        Debug.WriteLine("[Monitor] Minecraft stopped");
+                        // Minecraft stopped - clear running state but keep cached version
+                        _runningVersion = null;
+                    }
+                }
+                
+                // Periodic cache refresh (every 60 seconds while running) to catch version updates
+                if (isRunning && (DateTime.Now - _lastSystemVersionCheck).TotalSeconds > 60)
+                {
+                    Debug.WriteLine("[Monitor] Periodic version refresh (60s elapsed)");
+                    Task.Run(() =>
+                    {
+                        try
+                        {
+                            string uwpVersion = GetSystemInstalledMinecraftVersion(MinecraftPackageFamilies.MINECRAFT);
+                            string previewVersion = GetSystemInstalledMinecraftVersion(MinecraftPackageFamilies.MINECRAFT_PREVIEW);
+                            string detectedVersion = uwpVersion ?? previewVersion;
+                            
+                            if (!string.IsNullOrEmpty(detectedVersion) && detectedVersion != _cachedSystemVersion)
+                            {
+                                _cachedSystemVersion = detectedVersion;
+                                _lastSystemVersionCheck = DateTime.Now;
+                                Debug.WriteLine($"[Monitor] Version changed: {detectedVersion}");
+                                
+                                var matchedVersion = _versions.FirstOrDefault(v => v.Name == detectedVersion);
+                                if (matchedVersion != null)
+                                {
+                                    _runningVersion = matchedVersion;
+                                    SaveRunningVersion(matchedVersion);
+                                }
+                            }
+                            else
+                            {
+                                _lastSystemVersionCheck = DateTime.Now;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"[Monitor] Periodic refresh failed: {ex.Message}");
+                        }
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Monitor] Timer tick error: {ex.Message}");
+            }
+        }
+        
+        // Wait for Minecraft to fully start by monitoring the launcher's state tracking
+        private async Task<bool> WaitForMinecraftReady(WPFDataTypes.Version v, int timeoutSeconds = 30)
+        {
+            string gameDir = Path.GetFullPath(v.GameDirectory);
+            string minecraftExe = Path.Combine(gameDir, "Minecraft.Windows.exe");
+            
+            var startTime = DateTime.Now;
+            bool processFound = false;
+            bool windowReady = false;
+            
+            // Phase 1: Wait for launcher state to complete (StateChangeInfo becomes null)
+            while ((DateTime.Now - startTime).TotalSeconds < timeoutSeconds)
+            {
+                if (v.StateChangeInfo == null)
+                {
+                    // Launcher finished its work
+                    break;
+                }
+                
+                // Still in launch process (Initializing, MovingData, Registering, Launching, etc.)
+                var state = v.StateChangeInfo.VersionState;
+                Debug.WriteLine($"WaitForMinecraftReady: Launcher state = {state}");
+                await Task.Delay(500);
+            }
+            
+            if (v.StateChangeInfo != null)
+            {
+                Debug.WriteLine("WaitForMinecraftReady: Timeout waiting for launcher state to complete");
+                return false;
+            }
+            
+            // Phase 2: Wait for process to exist and be ready
+            var phase2Start = DateTime.Now;
+            while ((DateTime.Now - phase2Start).TotalSeconds < 15)
+            {
+                try
+                {
+                    var processes = Process.GetProcessesByName("Minecraft.Windows");
+                    foreach (var proc in processes)
+                    {
+                        try
+                        {
+                            string procPath = proc.MainModule.FileName;
+                            if (procPath.Equals(minecraftExe, StringComparison.OrdinalIgnoreCase))
+                            {
+                                processFound = true;
+                                
+                                // Check if window is ready (has title and is visible)
+                                if (!string.IsNullOrEmpty(proc.MainWindowTitle) && 
+                                    proc.MainWindowTitle.IndexOf("Minecraft", StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    windowReady = true;
+                                    Debug.WriteLine($"WaitForMinecraftReady: Window ready - Title: {proc.MainWindowTitle}");
+                                    break;
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                    
+                    if (windowReady)
+                        break;
+                    
+                    if (processFound)
+                        Debug.WriteLine("WaitForMinecraftReady: Process found but window not ready yet");
+                    
+                    await Task.Delay(500);
+                }
+                catch { }
+            }
+            
+            if (!processFound)
+            {
+                Debug.WriteLine("WaitForMinecraftReady: Process never started");
+                return false;
+            }
+            
+            if (!windowReady)
+            {
+                Debug.WriteLine("WaitForMinecraftReady: Window not ready, using fallback delay");
+                await Task.Delay(3000); // Fallback safety delay
+            }
+            
+            // Extra safety delay to ensure MC is past packaging/registration
+            await Task.Delay(1000);
+            
+            Debug.WriteLine("WaitForMinecraftReady: Success");
+            return true;
         }
 
         private void InvokeRemove(WPFDataTypes.Version v)
@@ -1212,7 +3073,8 @@ namespace MCLauncher
                     {
                         Dispatcher.Invoke(() =>
                         {
-                            ShowFriendlySuccess(Localization.Get("VersionRemoved"), Localization.Format("VersionRemovedMessage", v.DisplayName));
+                            // Removed annoying success popup - user can see version is gone
+                            RefreshVersionLists();
                         });
                     }
                 });
@@ -1224,17 +3086,67 @@ namespace MCLauncher
             try
             {
                 v.StateChangeInfo = new VersionStateChangeInfo(VersionState.Unregistering);
+                Debug.WriteLine("Unregistering version " + v.DisplayName);
                 
-                // TODO: Implement full removal logic from original MainWindow
-                await Task.Delay(500);
-
-                if (v.IsImported && Directory.Exists(v.GameDirectory))
+                try
                 {
-                    v.StateChangeInfo = new VersionStateChangeInfo(VersionState.CleaningUp);
-                    Directory.Delete(v.GameDirectory, true);
+                    await UnregisterPackage(v.GamePackageFamily, v, skipBackup: false);
+                }
+                catch (Exception e)
+                {
+                    Debug.WriteLine("Failed unregistering package:\n" + e.ToString());
+                    Dispatcher.Invoke(() =>
+                    {
+                        ShowFriendlyError(
+                            Localization.Get("CouldntRemove"),
+                            Localization.Get("CouldntRemoveMessage") + "\n\n" + e.Message);
+                    });
+                    return false;
+                }
+                
+                Debug.WriteLine("Cleaning up game files for version " + v.DisplayName);
+                v.StateChangeInfo = new VersionStateChangeInfo(VersionState.CleaningUp);
+                
+                try
+                {
+                    // Use the \\?\ prefix to support long paths
+                    string fullPath = Path.GetFullPath(v.GameDirectory);
+                    string longPath = @"\\?\" + fullPath;
+                    
+                    if (Directory.Exists(fullPath))
+                    {
+                        Directory.Delete(longPath, true);
+                        Debug.WriteLine($"Deleted game directory: {fullPath}");
+                    }
+                    else
+                    {
+                        Debug.WriteLine($"Game directory doesn't exist: {fullPath}");
+                    }
+                }
+                catch (Exception e)
+                {
+                    Debug.WriteLine("Failed deleting game directory:\n" + e.ToString());
+                    Dispatcher.Invoke(() =>
+                    {
+                        ShowFriendlyError(
+                            Localization.Get("CouldntRemove"),
+                            Localization.Get("CouldntRemoveMessage") + "\n\n" + e.Message);
+                    });
+                    return false;
                 }
 
-                _versions.Remove(v);
+                // Update version list
+                if (v.IsImported)
+                {
+                    Dispatcher.Invoke(() => _versions.Remove(v));
+                    Debug.WriteLine("Removed imported version " + v.DisplayName);
+                }
+                else
+                {
+                    v.UpdateInstallStatus();
+                    Debug.WriteLine("Removed release version " + v.DisplayName);
+                }
+
                 return true;
             }
             catch (Exception ex)
@@ -1243,7 +3155,7 @@ namespace MCLauncher
                 Dispatcher.Invoke(() =>
                 {
                     ShowFriendlyError(Localization.Get("CouldntRemove"), 
-                        Localization.Get("CouldntRemoveMessage"));
+                        Localization.Get("CouldntRemoveMessage") + "\n\n" + ex.Message);
                 });
                 return false;
             }
@@ -1255,17 +3167,38 @@ namespace MCLauncher
 
         private void InvokeDownload(WPFDataTypes.Version v)
         {
-            if (v.IsStateChanging && !v.StateChangeInfo?.IsPaused == true)
+            // Allow resume if paused, otherwise block if already downloading
+            if (v.IsStateChanging && v.StateChangeInfo?.IsPaused != true)
                 return;
 
             CancellationTokenSource cancelSource = new CancellationTokenSource();
             _downloadCancelTokens[v] = cancelSource;
             
             v.IsNew = false;
-            v.StateChangeInfo = new VersionStateChangeInfo(VersionState.Initializing);
+            
+            // If resuming, keep existing StateChangeInfo, otherwise create new
+            bool isResuming = v.StateChangeInfo != null && v.StateChangeInfo.IsPaused;
+            
+            if (v.StateChangeInfo == null || !v.StateChangeInfo.IsPaused)
+            {
+                v.StateChangeInfo = new VersionStateChangeInfo(VersionState.Initializing);
+            }
+            else
+            {
+                // Resuming - reset to initializing but keep progress info
+                v.StateChangeInfo.IsPaused = false;
+                v.StateChangeInfo.VersionState = VersionState.Initializing;
+            }
+            
             v.StateChangeInfo.CancelCommand = new RelayCommand((o) =>
             {
+                Debug.WriteLine($"Cancel requested for {v.DisplayName}");
                 cancelSource.Cancel();
+                
+                // Clean up state immediately
+                v.StateChangeInfo = null;
+                RemoveActiveDownload(v);
+                
                 // Delete partial file on cancel
                 string versionsFolder = GetVersionsFolder();
                 string fileName = (v.VersionType == VersionType.Preview ? "Minecraft-Preview-" : "Minecraft-") + v.Name + (v.PackageType == PackageType.UWP ? ".Appx" : ".msixvc");
@@ -1273,188 +3206,240 @@ namespace MCLauncher
                 try
                 {
                     if (File.Exists(dlPath))
+                    {
                         File.Delete(dlPath);
+                        Debug.WriteLine($"Deleted partial download: {dlPath}");
+                    }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Failed to delete partial file: {ex.Message}");
+                }
             });
+            
+            // Add to active downloads (ensure it's there for both new and resumed downloads)
+            AddActiveDownload(v);
 
             Debug.WriteLine("Download start for version: " + v.DisplayName);
             
             Task.Run(async () =>
             {
-                // Use AppData versions folder instead of current directory
-                string versionsFolder = GetVersionsFolder();
-                string fileName = (v.VersionType == VersionType.Preview ? "Minecraft-Preview-" : "Minecraft-") + v.Name + (v.PackageType == PackageType.UWP ? ".Appx" : ".msixvc");
-                string dlPath = Path.Combine(versionsFolder, fileName);
-                
-                VersionDownloader downloader = _anonVersionDownloader;
-
-                VersionDownloader.DownloadProgress dlProgressHandler = (current, total) =>
-                {
-                    if (v.StateChangeInfo.VersionState != VersionState.Downloading)
-                    {
-                        Debug.WriteLine("Actual download started");
-                        v.StateChangeInfo.VersionState = VersionState.Downloading;
-                        if (total.HasValue)
-                            v.StateChangeInfo.MaxProgress = total.Value;
-                    }
-                    v.StateChangeInfo.Progress = current;
-                };
-
                 try
                 {
-                    if (v.PackageType == PackageType.UWP)
+                    // Use AppData versions folder instead of current directory
+                    string versionsFolder = GetVersionsFolder();
+                    string fileName = (v.VersionType == VersionType.Preview ? "Minecraft-Preview-" : "Minecraft-") + v.Name + (v.PackageType == PackageType.UWP ? ".Appx" : ".msixvc");
+                    string dlPath = Path.Combine(versionsFolder, fileName);
+                    
+                    VersionDownloader downloader = _anonVersionDownloader;
+
+                    VersionDownloader.DownloadProgress dlProgressHandler = (current, total) =>
                     {
-                        await downloader.DownloadAppx(v.UUID, "1", dlPath, dlProgressHandler, cancelSource.Token);
-                    }
-                    else if (v.PackageType == PackageType.GDK)
-                    {
-                        if (!ShowGDKFirstUseWarning())
+                        if (v.StateChangeInfo.VersionState != VersionState.Downloading)
                         {
-                            v.StateChangeInfo = null;
-                            v.UpdateInstallStatus();
-                            return;
+                            Debug.WriteLine("Actual download started");
+                            v.StateChangeInfo.VersionState = VersionState.Downloading;
+                            if (total.HasValue)
+                                v.StateChangeInfo.MaxProgress = total.Value;
                         }
-                        await downloader.DownloadMsixvc(v.DownloadURLs, dlPath, dlProgressHandler, cancelSource.Token);
+                        v.StateChangeInfo.Progress = current;
+                        
+                        // Update download progress
+                        if (total.HasValue && total.Value > 0)
+                        {
+                            int percentage = (int)((double)current / total.Value * 100);
+                        }
+                    };
+
+                    try
+                    {
+                        if (v.PackageType == PackageType.UWP)
+                        {
+                            await downloader.DownloadAppx(v.UUID, "1", dlPath, dlProgressHandler, cancelSource.Token);
+                        }
+                        else if (v.PackageType == PackageType.GDK)
+                        {
+                            if (!ShowGDKFirstUseWarning())
+                            {
+                                v.StateChangeInfo = null;
+                                v.UpdateInstallStatus();
+                                RemoveActiveDownload(v);
+                                return;
+                            }
+                            await downloader.DownloadMsixvc(v.DownloadURLs, dlPath, dlProgressHandler, cancelSource.Token);
+                        }
+                        else
+                        {
+                            throw new Exception("Unknown package type");
+                        }
+                        Debug.WriteLine("Download complete");
                     }
-                    else
+                    catch (BadUpdateIdentityException)
                     {
-                        throw new Exception("Unknown package type");
-                    }
-                    Debug.WriteLine("Download complete");
-                }
-                catch (BadUpdateIdentityException)
-                {
-                    Debug.WriteLine("Download failed due to failure to fetch download URL");
-                    Dispatcher.Invoke(() =>
-                    {
-                        ShowFriendlyError(Localization.Get("DownloadFailed"),
-                            "Unable to fetch download URL for version." +
-                            (v.VersionType == VersionType.Beta ? "\nFor beta versions, please make sure your account is subscribed to the Minecraft beta programme in the Xbox Insider Hub app." : ""));
-                    });
-                    v.StateChangeInfo = null;
-                    return;
-                }
-                catch (Exception e)
-                {
-                    Debug.WriteLine("Download failed:\n" + e.ToString());
-                    if (!(e is TaskCanceledException))
-                    {
+                        Debug.WriteLine("Download failed due to failure to fetch download URL");
                         Dispatcher.Invoke(() =>
                         {
                             ShowFriendlyError(Localization.Get("DownloadFailed"),
-                                Localization.Get("DownloadFailedMessage") + "\n\nError: " + e.Message);
+                                Localization.Get("DownloadFailedMessage") +
+                                (v.VersionType == VersionType.Beta ? "\n" + Localization.Get("BadUpdateIDBeta") : ""));
                         });
+                        v.StateChangeInfo = null;
+                        RemoveActiveDownload(v);
+                        return;
                     }
-                    v.StateChangeInfo = null;
-                    return;
-                }
+                    catch (Exception e)
+                    {
+                        Debug.WriteLine("Download failed:\n" + e.ToString());
+                        
+                        // Check if this was a pause operation (not a real error)
+                        if (e is TaskCanceledException && v.StateChangeInfo?.IsPaused == true)
+                        {
+                            Debug.WriteLine("Download paused by user - keeping state");
+                            // Don't clear StateChangeInfo, keep it paused
+                            // Don't remove from active downloads either
+                            return;
+                        }
+                        
+                        if (!(e is TaskCanceledException))
+                        {
+                            Dispatcher.Invoke(() =>
+                            {
+                                ShowFriendlyError(Localization.Get("DownloadFailed"),
+                                    Localization.Get("DownloadFailedMessage") + "\n\nError: " + e.Message);
+                            });
+                        }
+                        v.StateChangeInfo = null;
+                        RemoveActiveDownload(v);
+                        return;
+                    }
 
-                // Extract the downloaded package
-                try
-                {
-                    string dirPath = v.GameDirectory;
-                    if (Directory.Exists(dirPath))
-                        Directory.Delete(dirPath, true);
-                    
-                    if (v.PackageType == PackageType.UWP)
+                    // Extract the downloaded package
+                    try
                     {
-                        await ExtractAppx(dlPath, dirPath, v);
+                        string dirPath = v.GameDirectory;
+                        if (Directory.Exists(dirPath))
+                            Directory.Delete(dirPath, true);
+                        
+                        if (v.PackageType == PackageType.UWP)
+                        {
+                            await ExtractAppx(dlPath, dirPath, v);
+                        }
+                        else if (v.PackageType == PackageType.GDK)
+                        {
+                            await ExtractMsixvc(dlPath, dirPath, v, isPreview: v.VersionType == VersionType.Preview);
+                        }
+                        else
+                        {
+                            throw new Exception("Unknown package type");
+                        }
+                        
+                        if (UserPrefs.DeleteAppxAfterDownload)
+                        {
+                            Debug.WriteLine("Deleting package to reduce disk usage");
+                            File.Delete(dlPath);
+                        }
+                        else
+                        {
+                            Debug.WriteLine("Not deleting package due to user preferences");
+                        }
                     }
-                    else if (v.PackageType == PackageType.GDK)
+                    catch (Exception e)
                     {
-                        await ExtractMsixvc(dlPath, dirPath, v, isPreview: v.VersionType == VersionType.Preview);
+                        Debug.WriteLine("Extraction failed:\n" + e.ToString());
+                        Dispatcher.Invoke(() =>
+                        {
+                            ShowFriendlyError(Localization.Get("ExtractionFailed"),
+                                Localization.Get("ExtractionFailedMessage") + "\n\nError: " + e.Message);
+                        });
+                        v.StateChangeInfo = null;
+                        RemoveActiveDownload(v);
+                        return;
                     }
-                    else
-                    {
-                        throw new Exception("Unknown package type");
-                    }
-                    
-                    if (UserPrefs.DeleteAppxAfterDownload)
-                    {
-                        Debug.WriteLine("Deleting package to reduce disk usage");
-                        File.Delete(dlPath);
-                    }
-                    else
-                    {
-                        Debug.WriteLine("Not deleting package due to user preferences");
-                    }
-                }
-                catch (Exception e)
-                {
-                    Debug.WriteLine("Extraction failed:\n" + e.ToString());
+
+                    v.StateChangeInfo = null;
+                    v.UpdateInstallStatus();
+                    RemoveActiveDownload(v);
+
                     Dispatcher.Invoke(() =>
                     {
-                        ShowFriendlyError(Localization.Get("ExtractionFailed"),
-                            Localization.Get("ExtractionFailedMessage") + "\n\nError: " + e.Message);
+                        // Removed annoying success popup - user can see version is installed
+                        RefreshVersionLists();
                     });
-                    v.StateChangeInfo = null;
-                    return;
                 }
-
-                v.StateChangeInfo = null;
-                v.UpdateInstallStatus();
-
-                Dispatcher.Invoke(() =>
+                catch (Exception ex)
                 {
-                    ShowFriendlySuccess(Localization.Get("DownloadComplete"),
-                        Localization.Format("DownloadCompleteMessage", v.DisplayName));
-                    RefreshVersionLists();
-                });
+                    Debug.WriteLine($"Unexpected error in download task: {ex}");
+                    RemoveActiveDownload(v);
+                    v.StateChangeInfo = null;
+                }
             });
         }
 
         private async Task<bool> ExtractAppx(string filePath, string directory, WPFDataTypes.Version versionEntry)
         {
-            versionEntry.StateChangeInfo = new VersionStateChangeInfo(VersionState.Extracting);
+            // CRITICAL: Acquire semaphore to prevent concurrent extraction corruption
+            await _extractionSemaphore.WaitAsync();
             try
             {
-                await Task.Run(() =>
+                versionEntry.StateChangeInfo = new VersionStateChangeInfo(VersionState.Extracting);
+                try
                 {
-                    string fullDestDir = Path.GetFullPath(directory);
-                    if (!fullDestDir.EndsWith(Path.DirectorySeparatorChar.ToString()))
+                    bool success = await Task.Run(() =>
                     {
-                        fullDestDir += Path.DirectorySeparatorChar;
+                        // Use robust extractor with progress callback
+                        return RobustZipExtractor.ExtractZipFile(filePath, directory, (current, total) =>
+                        {
+                            if (total > 0)
+                            {
+                                long progress = (long)((double)current / total * 100);
+                                // CRITICAL: Use BeginInvoke to avoid blocking the extraction thread
+                                Dispatcher.BeginInvoke(new Action(() =>
+                                {
+                                    if (versionEntry.StateChangeInfo != null)
+                                    {
+                                        versionEntry.StateChangeInfo.MaxProgress = 100;
+                                        versionEntry.StateChangeInfo.Progress = progress;
+                                    }
+                                }));
+                            }
+                        });
+                    });
+                    
+                    if (!success)
+                    {
+                        Debug.WriteLine("Extract failed: RobustZipExtractor returned false");
+                        ShowFriendlyError(Localization.Get("ExtractionFailed"), 
+                            Localization.Get("ExtractionFailedMessage"));
+                        return false;
                     }
                     
-                    using (var archive = System.IO.Compression.ZipFile.OpenRead(filePath))
+                    // Clean up signature file
+                    string sigPath = Path.Combine(directory, "AppxSignature.p7x");
+                    if (File.Exists(sigPath)) 
                     {
-                        foreach (var entry in archive.Entries)
-                        {
-                            string destPath = Path.GetFullPath(Path.Combine(directory, entry.FullName));
-                            if (!destPath.StartsWith(fullDestDir, StringComparison.OrdinalIgnoreCase))
-                            {
-                                throw new IOException("Zip Slip vulnerability detected: " + entry.FullName);
-                            }
-                            if (string.IsNullOrEmpty(entry.Name))
-                            {
-                                Directory.CreateDirectory(destPath);
-                            }
-                            else
-                            {
-                                Directory.CreateDirectory(Path.GetDirectoryName(destPath));
-                                entry.ExtractToFile(destPath, true);
-                            }
-                        }
+                        try { File.Delete(sigPath); } catch { }
                     }
-                    string signaturePath = Path.Combine(directory, "AppxSignature.p7x");
-                    if (File.Exists(signaturePath))
-                        File.Delete(signaturePath);
-                });
+                    
+                    // Bfix injection is now manual via unlock button
 
-                versionEntry.UpdateInstallStatus();
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine("Extract failed: " + ex.ToString());
-                ShowFriendlyError(Localization.Get("ExtractionFailed"), 
-                    Localization.Get("ExtractionFailedMessage"));
-                return false;
+                    versionEntry.UpdateInstallStatus();
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine("Extract failed: " + ex.ToString());
+                    ShowFriendlyError(Localization.Get("ExtractionFailed"), 
+                        Localization.Get("ExtractionFailedMessage") + $"\n\nError: {ex.Message}");
+                    return false;
+                }
+                finally
+                {
+                    versionEntry.StateChangeInfo = null;
+                }
             }
             finally
             {
-                versionEntry.StateChangeInfo = null;
+                _extractionSemaphore.Release();
             }
         }
 
@@ -1477,88 +3462,95 @@ namespace MCLauncher
                 RecursiveCopyDirectory(source, destination, skip);
             }
         }
+        
+        /// <summary>
+        /// Convert long path with spaces to 8.3 short path format
+        /// Example: "C:\Users\big snigga\Desktop\file.msixvc" -> "C:\Users\BIGSNI~1\Desktop\file.msixvc"
+        /// </summary>
+        private static string GetShortPath(string longPath)
+        {
+            try
+            {
+                // Buffer needs to be larger for long paths
+                StringBuilder shortPath = new StringBuilder(500);
+                uint result = GetShortPathName(longPath, shortPath, (uint)shortPath.Capacity);
+                
+                if (result > 0 && result < shortPath.Capacity)
+                {
+                    string converted = shortPath.ToString();
+                    Debug.WriteLine($"[GetShortPath] Converted: {longPath} -> {converted}");
+                    return converted;
+                }
+                
+                Debug.WriteLine($"[GetShortPath] Conversion failed (result={result}), using original path");
+                return longPath;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[GetShortPath] Exception: {ex.Message}");
+                return longPath;
+            }
+        }
 
         private async Task<bool> ExtractMsixvc(string filePath, string directory, WPFDataTypes.Version versionEntry, bool isPreview)
         {
-            if (_hasGdkExtractTask)
+            // CRITICAL: Use semaphore for atomic check-and-acquire (prevents race condition)
+            bool acquired = await _gdkExtractSemaphore.WaitAsync(0); // Non-blocking check
+            if (!acquired)
             {
                 ShowFriendlyError(
-                    "Concurrent installation",
-                    "Can't install multiple MSIXVC packages at the same time. Please wait for the current installation to finish before starting a new one.");
+                    Localization.Get("ConcurrentInstall"),
+                    Localization.Get("ConcurrentInstallMessage"));
                 return false;
             }
-            _hasGdkExtractTask = true;
             try
             {
-                Debug.WriteLine("=== ExtractMsixvc Debug Info ===");
-                Debug.WriteLine($"File path: {filePath}");
-                Debug.WriteLine($"File exists: {File.Exists(filePath)}");
-                Debug.WriteLine($"File size: {(File.Exists(filePath) ? new FileInfo(filePath).Length : 0)} bytes");
-                Debug.WriteLine($"Destination directory: {directory}");
-                Debug.WriteLine($"Package family: {versionEntry.GamePackageFamily}");
-                Debug.WriteLine($"Is Preview: {isPreview}");
-                
                 directory = Path.GetFullPath(directory);
+                // XVC are encrypted containers, I don't currently know of any way to extract them to an arbitrary directory
+                // For now we just stage the package in XboxGames, and then move the files to the launcher data directory
+
                 versionEntry.StateChangeInfo = new VersionStateChangeInfo(VersionState.Staging);
 
                 var packageManager = new Windows.Management.Deployment.PackageManager();
 
-                Debug.WriteLine("Step 1: Clearing existing XboxGames Minecraft installation");
+                //make sure XboxGames is cleared
+                Debug.WriteLine("Clearing existing XboxGames Minecraft installation");
                 try
                 {
                     await UnregisterPackage(versionEntry.GamePackageFamily, versionEntry, skipBackup: false);
-                    Debug.WriteLine("Step 1: Complete - Existing packages cleared");
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"Step 1: FAILED - {ex.GetType().Name}: {ex.Message}");
-                    Debug.WriteLine($"Stack trace: {ex.StackTrace}");
                     ShowFriendlyError(
-                        "Failed clearing XboxGames",
-                        "The existing XboxGames Minecraft installation could not be removed. Please make sure Minecraft is not running and try again.\n\nError: " + ex.Message);
+                        Localization.Get("ClearXboxGamesFailed"),
+                        Localization.Format("ClearXboxGamesFailedMessage", ex.Message));
                     return false;
                 }
 
-                Debug.WriteLine("Step 2: Staging MSIXVC package");
-                Debug.WriteLine($"Staging URI: {new Uri(filePath).AbsoluteUri}");
+                CreateCustomInstallStub();
+
                 try
                 {
                     await DeploymentProgressWrapper(packageManager.StagePackageAsync(new Uri(filePath), null), versionEntry);
-                    Debug.WriteLine("Step 2: Complete - Package staged successfully");
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"Step 2: FAILED - {ex.GetType().Name}: {ex.Message}");
-                    Debug.WriteLine($"HRESULT: {ex.HResult:X8}");
-                    Debug.WriteLine($"Stack trace: {ex.StackTrace}");
-                    if (ex.InnerException != null)
-                    {
-                        Debug.WriteLine($"Inner exception: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
-                    }
                     ShowFriendlyError(
-                        "Failed to stage package",
-                        $"Failed to stage package.\n" +
-                            $"This may mean that the file is damaged, not an MSIXVC file. Please check the integrity of the file.\n\n" +
-                            $"However, this error might also happen if you've never installed a GDK version of Minecraft from the Store before,\n" +
-                            $"as the launcher relies on the Store to install the keys needed to decrypt the installation package.\n" +
-                            $"Please ensure that you've installed " + (isPreview ? "Minecraft Preview" : "Minecraft") + $" from the Store before installing GDK versions using the launcher.\n\n" +
-                            $"Error: {ex.Message}\n" +
-                            $"HRESULT: 0x{ex.HResult:X8}\n\n" +
-                            $"Check Log.txt for detailed debug information.");
+                        Localization.Get("StagingFailed"),
+                        Localization.Get("StagingFailedMessage") + "\n\n" +
+                        (isPreview ? Localization.Get("EnsurePreviewInstalled") : Localization.Get("EnsureMinecraftInstalled")) + "\n\n" +
+                        "Error: " + ex.Message);
                     return false;
                 }
 
-                Debug.WriteLine("Step 3: Finding staged package location");
                 string installPath = "";
                 foreach (var pkg in new Windows.Management.Deployment.PackageManager().FindPackages(versionEntry.GamePackageFamily))
                 {
-                    Debug.WriteLine($"Found package: {pkg.Id.FullName} at {pkg.InstalledLocation?.Path ?? "NULL"}");
                     if (installPath != "")
                     {
                         ShowFriendlyError(
-                            "Multiple locations found",
-                            "Minecraft is installed in multiple places, and the launcher doesn't know where to copy files from.\n" +
-                            "This is probably because another user has the game installed.");
+                            Localization.Get("MultiplePackagesFound"),
+                            Localization.Get("MultiplePackagesFoundMessage"));
                         return false;
                     }
                     installPath = pkg.InstalledLocation.Path;
@@ -1572,15 +3564,15 @@ namespace MCLauncher
                 if (!Directory.Exists(installPath))
                 {
                     ShowFriendlyError(
-                        "Installation directory not found",
-                        "Didn't find installation expected at " + installPath + "\nMaybe your XboxGames folder is in a different location?");
+                        Localization.Get("InstallPathNotFound"),
+                        Localization.Format("InstallPathNotFoundMessage", installPath));
                     return false;
                 }
                 if (!File.Exists(exeSrcPath))
                 {
                     ShowFriendlyError(
-                        "Minecraft executable not found",
-                        "Didn't find Minecraft executable at " + exeSrcPath);
+                        Localization.Get("MinecraftExeNotFound"),
+                        Localization.Format("MinecraftExeNotFoundMessage", exeSrcPath));
                     return false;
                 }
 
@@ -1596,30 +3588,35 @@ namespace MCLauncher
                     catch (IOException ex)
                     {
                         ShowFriendlyError(
-                            "Failed to create tmp dir",
-                            "The temporary directory for extracting the Minecraft executable could not be created at " + exeTmpDir + "\n\nError: " + ex.Message);
+                            Localization.Get("TmpDirCreateFailed"),
+                            Localization.Format("TmpDirCreateFailedMessage", exeTmpDir, ex.Message));
                         return false;
                     }
                 }
                 var uuid = Guid.NewGuid().ToString();
+                //Use a different tmp path to make sure we don't copy half-done files
+                //UUID makes sure we don't copy the leftovers of a different, failed installation
                 var exeTmpPath = Path.Combine(exeTmpDir, "Minecraft.Windows_" + uuid + ".exe");
                 var exePartialTmpPath = exeTmpPath + ".tmp";
 
                 var exeDstPath = Path.Combine(Path.GetFullPath(directory), "Minecraft.Windows.exe");
 
-                // Prevent Command Injection by encoding the inner PowerShell payload
-                string innerPayload = $"Copy-Item -LiteralPath '{exeSrcPath.Replace("'", "''")}' -Destination '{exePartialTmpPath.Replace("'", "''")}' -Force; Move-Item -LiteralPath '{exePartialTmpPath.Replace("'", "''")}' -Destination '{exeTmpPath.Replace("'", "''")}'";
-                string encodedInner = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(innerPayload));
-                
-                string outerPayload = $"Invoke-CommandInDesktopPackage -PackageFamilyName '{versionEntry.GamePackageFamily.Replace("'", "''")}' -App Game -Command 'powershell.exe' -Args '-WindowStyle Hidden -EncodedCommand {encodedInner}'";
-                string encodedOuter = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(outerPayload));
+                string psScript = $"Copy-Item '{exeSrcPath.Replace("'", "''")}' '{exePartialTmpPath.Replace("'", "''")}' -Force; Move-Item '{exePartialTmpPath.Replace("'", "''")}' '{exeTmpPath.Replace("'", "''")}'";
+                byte[] scriptBytes = System.Text.Encoding.Unicode.GetBytes(psScript);
+                string encodedScript = Convert.ToBase64String(scriptBytes);
 
-                Debug.WriteLine("Decrypt command (encoded): " + outerPayload);
+                var command = $@"Invoke-CommandInDesktopPackage `
+                            -PackageFamilyName ""{versionEntry.GamePackageFamily}"" `
+                            -App Game `
+                            -Command ""powershell.exe"" `
+                            -Args \""-EncodedCommand {encodedScript}\""";
+                
+                Debug.WriteLine("Decrypt command: " + command);
 
                 var processInfo = new ProcessStartInfo
                 {
                     FileName = "powershell.exe",
-                    Arguments = $"-NoProfile -NonInteractive -EncodedCommand {encodedOuter}",
+                    Arguments = command,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
@@ -1630,20 +3627,24 @@ namespace MCLauncher
                 try
                 {
                     var process = Process.Start(processInfo);
-                    process.WaitForExit();
+                    // CRITICAL: Don't block UI thread - wait asynchronously
+                    await Task.Run(() => process.WaitForExit());
                     Debug.WriteLine("Process output:" + process.StandardOutput.ReadToEnd());
                     Debug.WriteLine("Process errors:" + process.StandardError.ReadToEnd());
                 }
                 catch (Exception ex)
                 {
                     ShowFriendlyError(
-                        "PowerShell failed",
-                        "Failed to run PowerShell to copy the Minecraft executable out of the staged package\n\nError: " + ex.Message);
+                        Localization.Get("PowerShellExeFailed"),
+                        Localization.Format("PowerShellExeFailedMessage", ex.Message));
                     return false;
                 }
 
                 for (int i = 0; i < 300 && !File.Exists(exeTmpPath); i++)
                 {
+                    //Give it up to 30 seconds to copy the file
+                    //We can't block on the outcome of Invoke-CommandInDesktopPackage, so we have to poll for the file
+                    //TODO: What if the copy takes longer than that?
                     await Task.Delay(100);
                 }
 
@@ -1652,52 +3653,146 @@ namespace MCLauncher
                     Debug.WriteLine("Src path: " + exeSrcPath);
                     Debug.WriteLine("Tmp path: " + exeTmpPath);
                     ShowFriendlyError(
-                        "Exe extraction failed",
-                        "The Minecraft executable could not be copied out of the staged package.\n" +
-                            "This is usually due to the game license not being installed for your Windows user account.\n\n" +
-                            "Please ensure that you've installed " + (isPreview ? "Minecraft Preview" : "Minecraft") + " from the Store before using this launcher.");
+                        Localization.Get("ExeDecryptFailed"),
+                        Localization.Get("ExeDecryptFailedMessage") + "\n\n" +
+                        (isPreview ? Localization.Get("EnsurePreviewInstalled") : Localization.Get("EnsureMinecraftInstalled")));
                     return false;
                 }
                 Debug.WriteLine("Minecraft executable decrypted successfully");
 
                 versionEntry.StateChangeInfo.VersionState = VersionState.Moving;
+                //TODO: this could fail if the launcher is on a different drive than C: ?
                 try
                 {
                     Debug.WriteLine("Moving staged files: " + installPath + " -> " + directory);
-                    if (Path.GetPathRoot(installPath) == Path.GetPathRoot(directory))
+                    
+                    // CRITICAL: Move/copy operations can take a long time - run on background thread
+                    await Task.Run(() =>
                     {
-                        Debug.WriteLine("Destination for extraction is on the same drive as the installation location - moving files for speed");
-                        Directory.Move(installPath, directory);
-                    }
-                    else
-                    {
-                        Debug.WriteLine("Destination for extraction is on a different drive than staged - copying files");
-                        HashSet<string> skip = new HashSet<string>();
-                        skip.Add(exeSrcPath);
-                        RecursiveCopyDirectory(installPath, directory, skip);
-                    }
+                        if (Path.GetPathRoot(installPath) == Path.GetPathRoot(directory))
+                        {
+                            Debug.WriteLine("Destination for extraction is on the same drive as the installation location - moving files for speed");
+                            Directory.Move(installPath, directory);
+                        }
+                        else
+                        {
+                            Debug.WriteLine("Destination for extraction is on a different drive than staged - copying files");
+                            //Minecraft.Windows.exe can't be copied directly due to permissions
+                            HashSet<string> skip = new HashSet<string>();
+                            skip.Add(exeSrcPath);
+                            RecursiveCopyDirectory(installPath, directory, skip);
+                        }
+                    });
 
                     Debug.WriteLine("Moving decrypted exe into place");
-                    File.Delete(exeDstPath);
-                    File.Move(exeTmpPath, exeDstPath);
+                    await Task.Run(() =>
+                    {
+                        File.Delete(exeDstPath);
+                        File.Move(exeTmpPath, exeDstPath);
+                    });
                 }
                 catch (Exception ex)
                 {
                     ShowFriendlyError(
-                        "Failed moving game files",
-                        "Failed copying/moving game files to the destination folder\n\nError: " + ex.Message);
+                        Localization.Get("MoveFilesFailed"),
+                        Localization.Format("MoveFilesFailedMessage", ex.Message));
                     return false;
                 }
 
                 Debug.WriteLine("Cleaning up XboxGames");
+                //we already created a backup earlier, so a new attempt would just get in the way
                 await UnregisterPackage(versionEntry.GamePackageFamily, versionEntry, skipBackup: true);
 
                 Debug.WriteLine("Done importing msixvc: " + filePath);
                 return true;
+
             }
             finally
             {
-                _hasGdkExtractTask = false;
+                _gdkExtractSemaphore.Release();
+            }
+        }
+
+
+        /// <summary>
+        /// Writes a minimal no-op x64 PE to C:\Windows\System32\custominstallexec.exe
+        /// so Windows Gaming Services doesn't pop a "cannot find" dialog when it tries
+        /// to run custom install actions during MSIXVC staging/registration.
+        /// Only writes if the file does not already exist.
+        /// </summary>
+        private void CreateCustomInstallStub()
+        {
+            const string stubPath = @"C:\Windows\System32\custominstallexec.exe";
+            if (File.Exists(stubPath))
+            {
+                Debug.WriteLine("custominstallexec.exe already exists — skipping stub");
+                return;
+            }
+
+            try
+            {
+                // Minimal valid x64 PE (1024 bytes) whose entry point is: xor eax,eax; ret
+                // No imports, no resources. Returns 0 immediately and terminates.
+                byte[] pe = new byte[0x400]; // zero-filled
+
+                // --- DOS Header ---
+                pe[0x00] = 0x4D; pe[0x01] = 0x5A;  // MZ
+                pe[0x3C] = 0x40;                    // e_lfanew = offset of PE header
+
+                // --- PE Signature ---
+                pe[0x40] = 0x50; pe[0x41] = 0x45;  // "PE\0\0"
+
+                // --- COFF Header ---
+                pe[0x44] = 0x64; pe[0x45] = 0x86;  // Machine = AMD64 (0x8664 LE)
+                pe[0x46] = 0x01;                    // NumberOfSections = 1
+                pe[0x54] = 0xF0;                    // SizeOfOptionalHeader = 240
+                pe[0x56] = 0x22;                    // Characteristics: EXEC | LARGE_ADDRESS_AWARE
+
+                // --- Optional Header (PE32+) ---
+                pe[0x58] = 0x0B; pe[0x59] = 0x02;  // Magic = PE32+
+                pe[0x5C] = 0x00; pe[0x5D] = 0x02;  // SizeOfCode = 0x200
+                pe[0x68] = 0x00; pe[0x69] = 0x10;  // AddressOfEntryPoint = 0x1000
+                pe[0x6C] = 0x00; pe[0x6D] = 0x10;  // BaseOfCode = 0x1000
+                // ImageBase = 0x0000000140000000
+                pe[0x73] = 0x40; pe[0x74] = 0x01;
+                // SectionAlignment = 0x1000
+                pe[0x78] = 0x00; pe[0x79] = 0x10;
+                // FileAlignment = 0x200
+                pe[0x7C] = 0x00; pe[0x7D] = 0x02;
+                pe[0x80] = 0x06;                    // MajorOSVersion = 6
+                pe[0x88] = 0x06;                    // MajorSubsystemVersion = 6
+                pe[0x91] = 0x20;                    // SizeOfImage = 0x2000
+                pe[0x95] = 0x02;                    // SizeOfHeaders = 0x200
+                pe[0x9C] = 0x03;                    // Subsystem = 3 (console)
+                pe[0xA2] = 0x10;                    // SizeOfStackReserve = 0x100000
+                pe[0xA8] = 0x00; pe[0xA9] = 0x10;  // SizeOfStackCommit = 0x1000
+                pe[0xB2] = 0x10;                    // SizeOfHeapReserve = 0x100000
+                pe[0xB8] = 0x00; pe[0xB9] = 0x10;  // SizeOfHeapCommit = 0x1000
+                pe[0xC4] = 0x10;                    // NumberOfRvaAndSizes = 16
+                // DataDirectory[0..15] all zero (no imports/exports/resources)
+
+                // --- Section Header[0] ".text" at 0x148 ---
+                pe[0x148] = (byte)'.'; pe[0x149] = (byte)'t';
+                pe[0x14A] = (byte)'e'; pe[0x14B] = (byte)'x'; pe[0x14C] = (byte)'t';
+                pe[0x150] = 0x03;                    // VirtualSize = 3 (code bytes)
+                pe[0x154] = 0x00; pe[0x155] = 0x10; // VirtualAddress = 0x1000
+                pe[0x158] = 0x00; pe[0x159] = 0x02; // SizeOfRawData = 0x200
+                pe[0x15C] = 0x00; pe[0x15D] = 0x02; // PointerToRawData = 0x200
+                // Characteristics = 0x60000020 (CODE | MEM_EXECUTE | MEM_READ)
+                pe[0x16C] = 0x20; pe[0x16F] = 0x60;
+
+                // --- Code at file offset 0x200 ---
+                pe[0x200] = 0x31; pe[0x201] = 0xC0; // xor eax, eax
+                pe[0x202] = 0xC3;                    // ret  (BaseProcessStart calls ExitProcess(eax))
+
+                File.WriteAllBytes(stubPath, pe);
+                Debug.WriteLine($"Created no-op custominstallexec.exe stub at {stubPath}");
+            }
+            catch (Exception ex)
+            {
+                // Non-fatal: if we can't write it, the dialog might still appear,
+                // but the import will continue regardless.
+                Debug.WriteLine($"Warning: could not create custominstallexec.exe stub: {ex.Message}");
             }
         }
 
@@ -1705,8 +3800,10 @@ namespace MCLauncher
         {
             XDocument doc = XDocument.Load(path);
             XNamespace ns = "http://schemas.microsoft.com/appx/manifest/foundation/windows10";
+            XNamespace uap = "http://schemas.microsoft.com/appx/manifest/uap/windows10";
             XNamespace rescap = "http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities";
 
+            // Fix executable name if needed
             var apps = doc.Descendants(ns + "Application");
             foreach (var app in apps)
             {
@@ -1715,14 +3812,40 @@ namespace MCLauncher
                 {
                     executable.Value = "Minecraft.Windows.exe";
                 }
+                
+                // Remove Extensions from inside Application element (uap:Extensions contains protocols)
+                var uapExtensions = app.Elements(uap + "Extensions").ToList();
+                foreach (var ext in uapExtensions)
+                {
+                    Debug.WriteLine("Removing uap:Extensions element from Application");
+                    ext.Remove();
+                }
+                
+                // Also check for non-namespaced Extensions
+                var appExtensions = app.Elements(ns + "Extensions").ToList();
+                foreach (var ext in appExtensions)
+                {
+                    Debug.WriteLine("Removing Extensions element from Application");
+                    ext.Remove();
+                }
             }
 
-            var extensions = doc.Root.Elements(ns + "Extensions").ToList();
-            foreach (var ext in extensions)
+            // Remove Extensions from Package root (if any)
+            var rootExtensions = doc.Root.Elements(ns + "Extensions").ToList();
+            foreach (var ext in rootExtensions)
             {
+                Debug.WriteLine("Removing Extensions element from Package root");
+                ext.Remove();
+            }
+            
+            var rootUapExtensions = doc.Root.Elements(uap + "Extensions").ToList();
+            foreach (var ext in rootUapExtensions)
+            {
+                Debug.WriteLine("Removing uap:Extensions element from Package root");
                 ext.Remove();
             }
 
+            // Remove customInstallActions capability
             var capabilities = doc.Descendants(ns + "Capabilities");
             var customInstall = capabilities
                 .Elements(rescap + "Capability")
@@ -1730,10 +3853,12 @@ namespace MCLauncher
                 .ToList();
             foreach (var cap in customInstall)
             {
+                Debug.WriteLine("Removing customInstallActions capability");
                 cap.Remove();
             }
 
             doc.Save(path);
+            Debug.WriteLine($"Fixed GDK manifest: {path}");
         }
 
         private async Task DeploymentProgressWrapper(Windows.Foundation.IAsyncOperationWithProgress<Windows.Management.Deployment.DeploymentResult, Windows.Management.Deployment.DeploymentProgress> t, WPFDataTypes.Version version)
@@ -1742,6 +3867,15 @@ namespace MCLauncher
             t.Progress += (v, p) =>
             {
                 Debug.WriteLine("Deployment progress: " + p.state + " " + p.percentage + "%");
+                // CRITICAL: Update UI with progress to prevent frozen appearance
+                if (version.StateChangeInfo != null) {
+                    // Use BeginInvoke for non-blocking UI updates
+                    Dispatcher.BeginInvoke(new Action(() => {
+                        version.StateChangeInfo.Progress = (long)p.percentage;
+                        version.StateChangeInfo.MaxProgress = 100;
+                        Debug.WriteLine($"UI Updated: Progress={p.percentage}%, MaxProgress=100");
+                    }));
+                }
             };
             t.Completed += (v, p) =>
             {
@@ -1816,13 +3950,41 @@ namespace MCLauncher
             {
                 if (GetWorldCountInDataDir(tmpDir) > 0)
                 {
-                    Debug.WriteLine("BackupMinecraftDataForRemoval error: " + tmpDir + " already exists");
-                    Process.Start("explorer.exe", tmpDir);
-                    Dispatcher.Invoke(() =>
+                    // Previous backup exists with worlds — try to merge instead of blocking
+                    Debug.WriteLine("BackupMinecraftDataForRemoval: previous backup exists with worlds at " + tmpDir);
+                    Debug.WriteLine("Attempting to merge new data alongside existing backup");
+                    
+                    try
                     {
-                        MessageBox.Show("The temporary directory for backing up MC data already exists. This probably means that we failed last time backing up the data. Please back the directory up manually.");
-                    });
-                    return false;
+                        // Merge: move new files into existing backup dir without overwriting
+                        RestoreMove(data.LocalFolder.Path, tmpDir);
+                        
+                        // Notify user that merge happened (non-blocking)
+                        Dispatcher.Invoke(() =>
+                        {
+                            MessageBox.Show(
+                                Localization.Get("BackupDirConflictMessage"),
+                                Localization.Get("BackupDirConflict"),
+                                MessageBoxButton.OK,
+                                MessageBoxImage.Information);
+                        });
+                        return true;
+                    }
+                    catch (Exception mergeEx)
+                    {
+                        // Merge failed — fall back to showing error with Explorer
+                        Debug.WriteLine("Merge failed: " + mergeEx.Message);
+                        Process.Start("explorer.exe", tmpDir);
+                        Dispatcher.Invoke(() =>
+                        {
+                            MessageBox.Show(
+                                Localization.Get("BackupMergeFailedMessage"),
+                                Localization.Get("BackupMergeFailed"),
+                                MessageBoxButton.OK,
+                                MessageBoxImage.Warning);
+                        });
+                        return false;
+                    }
                 }
                 Directory.Delete(tmpDir, recursive: true);
             }
@@ -1924,14 +4086,9 @@ namespace MCLauncher
                 Debug.WriteLine("Multiple world locations found:" + messageString);
                 string destinationFolder = destinationType == PackageType.UWP ? uwpDataDir : Path.Combine(gdkRoot, "Users");
                 
-                var result = MessageBox.Show(
-                    "Worlds were found in multiple locations:\n" + messageString +
-                    "\n\nThe version will look for worlds in: " + destinationFolder +
-                    "\n\nSome worlds may not be visible. Continue anyway?",
-                    "Multiple World Locations",
-                    MessageBoxButton.OKCancel,
-                    MessageBoxImage.Warning);
-                return result == MessageBoxResult.OK;
+                // Auto-accept multiple world locations - user doesn't need to see this
+                Debug.WriteLine($"Auto-accepting multiple world locations. Destination: {destinationFolder}");
+                return true;
             }
 
             string dataLocation = dataLocations.Keys.First();
@@ -2106,6 +4263,54 @@ namespace MCLauncher
                 RestoreMove(f, tp);
             }
         }
+
+        private void ApplyCustomColors()
+        {
+            try
+            {
+                // Apply custom colors from preferences if they're set
+                if (!string.IsNullOrEmpty(UserPrefs.Color_DarkBg))
+                {
+                    var darkBg = (SolidColorBrush)Resources["DarkBg"];
+                    darkBg.Color = (Color)ColorConverter.ConvertFromString(UserPrefs.Color_DarkBg);
+                }
+
+                if (!string.IsNullOrEmpty(UserPrefs.Color_CardBg))
+                {
+                    var cardBg = (SolidColorBrush)Resources["CardBg"];
+                    cardBg.Color = (Color)ColorConverter.ConvertFromString(UserPrefs.Color_CardBg);
+                    
+                    var cardHover = (SolidColorBrush)Resources["CardHover"];
+                    // Make hover slightly lighter
+                    var baseColor = (Color)ColorConverter.ConvertFromString(UserPrefs.Color_CardBg);
+                    cardHover.Color = Color.FromRgb(
+                        (byte)Math.Min(255, baseColor.R + 15),
+                        (byte)Math.Min(255, baseColor.G + 15),
+                        (byte)Math.Min(255, baseColor.B + 15)
+                    );
+                }
+
+                if (!string.IsNullOrEmpty(UserPrefs.Color_AccentGreen))
+                {
+                    var accentGreen = (SolidColorBrush)Resources["AccentGreen"];
+                    accentGreen.Color = (Color)ColorConverter.ConvertFromString(UserPrefs.Color_AccentGreen);
+                    
+                    var border = (SolidColorBrush)Resources["Border"];
+                    border.Color = (Color)ColorConverter.ConvertFromString(UserPrefs.Color_AccentGreen);
+                }
+
+                if (!string.IsNullOrEmpty(UserPrefs.Color_TextPrimary))
+                {
+                    var textPrimary = (SolidColorBrush)Resources["TextPrimary"];
+                    textPrimary.Color = (Color)ColorConverter.ConvertFromString(UserPrefs.Color_TextPrimary);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Failed to apply custom colors: {ex.Message}");
+                // Silently fail - use default colors
+            }
+        }
     }
 
     // ViewModel for modern UI
@@ -2113,6 +4318,23 @@ namespace MCLauncher
     {
         public WPFDataTypes.Version Version { get; }
         private ICommonVersionCommands _commands;
+        private bool _isRegistered;
+
+        public bool IsRegistered
+        {
+            get => _isRegistered;
+            set
+            {
+                if (_isRegistered != value)
+                {
+                    _isRegistered = value;
+                    OnPropertyChanged("IsRegistered");
+                    OnPropertyChanged("RegisteredIndicatorVisibility");
+                }
+            }
+        }
+
+        public Visibility RegisteredIndicatorVisibility => IsRegistered ? Visibility.Visible : Visibility.Collapsed;
 
         public ModernVersionViewModel(WPFDataTypes.Version version, ICommonVersionCommands commands)
         {
@@ -2134,25 +4356,39 @@ namespace MCLauncher
                     OnPropertyChanged("CancelButtonVisibility");
                     OnPropertyChanged("PauseResumeButtonVisibility");
                     OnPropertyChanged("PauseResumeButtonText");
+                    
+                    // Re-subscribe to new StateChangeInfo if it changed
+                    if (e.PropertyName == "StateChangeInfo" && Version.StateChangeInfo != null)
+                    {
+                        Version.StateChangeInfo.PropertyChanged += StateChangeInfo_PropertyChanged;
+                    }
                 }
             };
             
             // Subscribe to StateChangeInfo property changes
             if (Version.StateChangeInfo != null)
             {
-                Version.StateChangeInfo.PropertyChanged += (s, e) =>
-                {
-                    if (e.PropertyName == "Progress" || e.PropertyName == "MaxProgress" || e.PropertyName == "DisplayStatus")
-                    {
-                        OnPropertyChanged("ProgressText");
-                        OnPropertyChanged("MaxProgress");
-                        OnPropertyChanged("CurrentProgress");
-                    }
-                    if (e.PropertyName == "IsPaused")
-                    {
-                        OnPropertyChanged("PauseResumeButtonText");
-                    }
-                };
+                Version.StateChangeInfo.PropertyChanged += StateChangeInfo_PropertyChanged;
+            }
+        }
+        
+        private void StateChangeInfo_PropertyChanged(object sender, PropertyChangedEventArgs e)
+        {
+            if (e.PropertyName == "Progress" || e.PropertyName == "MaxProgress" || e.PropertyName == "DisplayStatus")
+            {
+                OnPropertyChanged("ProgressText");
+                OnPropertyChanged("MaxProgress");
+                OnPropertyChanged("CurrentProgress");
+            }
+            if (e.PropertyName == "IsPaused")
+            {
+                OnPropertyChanged("PauseResumeButtonText");
+            }
+            if (e.PropertyName == "VersionState")
+            {
+                // When VersionState changes, update button visibility
+                OnPropertyChanged("CancelButtonVisibility");
+                OnPropertyChanged("PauseResumeButtonVisibility");
             }
         }
 
@@ -2280,16 +4516,26 @@ namespace MCLauncher
         public ICommand LaunchCommand => _commands.LaunchCommand;
         public ICommand RemoveCommand => _commands.RemoveCommand;
         public ICommand DownloadCommand => _commands.DownloadCommand;
+        public ICommand UnlockCommand => _commands.UnlockCommand;
 
         // Localized button text
         public string PlayButtonText => Localization.Get("Play");
         public string DownloadButtonText => Localization.Get("Download");
         public string RemoveTooltipText => Localization.Get("RemoveTooltip");
-        public string PauseResumeButtonText => Version.StateChangeInfo?.IsPaused == true ? Localization.Get("Resume") : Localization.Get("Pause");
+        public string UnlockTooltipText => Localization.Get("UnlockTooltip");
+        public string PauseResumeButtonText
+        {
+            get
+            {
+                if (Version.StateChangeInfo == null)
+                    return Localization.Get("Pause");
+                return Version.StateChangeInfo.IsPaused ? Localization.Get("Resume") : Localization.Get("Pause");
+            }
+        }
         public string CancelButtonText => Localization.Get("Cancel");
 
         public event PropertyChangedEventHandler PropertyChanged;
-        protected void OnPropertyChanged(string name)
+        public void OnPropertyChanged(string name)
         {
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
         }

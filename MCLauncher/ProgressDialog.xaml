@@ -1,4 +1,4 @@
-﻿<Window x:Class="MCLauncher.ProgressDialog"
+<Window x:Class="MCLauncher.ProgressDialog"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
@@ -10,21 +10,29 @@
         SizeToContent="WidthAndHeight"
         MinWidth="400"
         WindowStartupLocation="CenterOwner"
-        Title="Cleanup for Microsoft Store install">
-    <Grid Margin="5,5,5,5">
+        Title="Cleanup"
+        Background="#161925">
+    <Grid Margin="20">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
-            <RowDefinition />
         </Grid.RowDefinitions>
 
-        <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="Auto" />
-            <ColumnDefinition />
-        </Grid.ColumnDefinitions>
+        <TextBlock Text="Cleanup" FontSize="20" FontWeight="Bold" Foreground="White" Margin="0,0,0,16"/>
 
-        <Label Content="Cleaning up system for installing Minecraft from Microsoft Store..." Grid.Row="0" Grid.Column="0" Padding="0,0,0,5" />
-        <ProgressBar Name="progressBar" Grid.Row="1" Grid.Column="0" Height="20" Grid.ColumnSpan="2" IsIndeterminate="True"/>
+        <TextBlock Text="Cleaning up system for installing Minecraft from Microsoft Store..." 
+                   Foreground="#8b95b8" 
+                   TextWrapping="Wrap"
+                   Margin="0,0,0,16" 
+                   Grid.Row="1" />
+                   
+        <ProgressBar Name="progressBar" 
+                     Grid.Row="2" 
+                     Height="6" 
+                     IsIndeterminate="True"
+                     Foreground="#3b82f6"
+                     Background="#12141c"
+                     BorderThickness="0"/>
     </Grid>
 </Window>

@@ -65,20 +65,21 @@ namespace MCLauncher {
                         
                         using (var inStream = await resp.Content.ReadAsStreamAsync())
                         {
-                            bool isPartial = resp.StatusCode == System.Net.HttpStatusCode.PartialContent;
-                            if (existingFileSize > 0 && !isPartial)
-                            {
-                                Debug.WriteLine("Server ignored Range header, starting from scratch.");
-                                existingFileSize = 0;
-                            }
-                            
                             FileMode fileMode = existingFileSize > 0 ? FileMode.Append : FileMode.Create;
                             using (var outStream = new FileStream(to, fileMode, FileAccess.Write, FileShare.None, 8192, useAsync: true))
                             {
                                 long? totalSize = resp.Content.Headers.ContentLength;
                                 if (totalSize.HasValue && existingFileSize > 0)
                                 {
-                                    totalSize = totalSize.Value + existingFileSize;
+                                    if (resp.StatusCode == System.Net.HttpStatusCode.PartialContent)
+                                    {
+                                        totalSize = totalSize.Value + existingFileSize;
+                                    }
+                                    else
+                                    {
+                                        existingFileSize = 0;
+                                        outStream.Position = 0;
+                                    }
                                 }
                                 
                                 progress(existingFileSize, totalSize);

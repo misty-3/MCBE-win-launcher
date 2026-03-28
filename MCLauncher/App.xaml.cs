@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
 using System.IO;
+using System.Threading.Tasks;
 using System.Windows;
 
 namespace MCLauncher {
@@ -35,32 +36,92 @@ namespace MCLauncher {
 
             try
             {
-                // Setup AppData directory - using Local instead of Roaming for game files
-                string appDataPath = Path.Combine(
+                // Load preferences to check for custom data path
+                // Check multiple locations for preferences.json
+                string appDataPath;
+                string defaultPath = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "MinecraftVersionLauncher");
+                
+                // Try to find and load preferences
+                Preferences loadedPrefs = null;
+                
+                // First check default AppData location
+                string defaultPrefsPath = Path.Combine(defaultPath, "preferences.json");
+                if (File.Exists(defaultPrefsPath))
+                {
+                    try
+                    {
+                        string prefsContent = File.ReadAllText(defaultPrefsPath);
+                        loadedPrefs = Newtonsoft.Json.JsonConvert.DeserializeObject<Preferences>(prefsContent);
+                        System.Diagnostics.Debug.WriteLine($"Loaded preferences from default location: {defaultPrefsPath}");
+                        if (loadedPrefs != null && !string.IsNullOrEmpty(loadedPrefs.LauncherDataPath))
+                        {
+                            System.Diagnostics.Debug.WriteLine($"Custom launcher data path found: {loadedPrefs.LauncherDataPath}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"Failed to load preferences from default location: {ex.Message}");
+                    }
+                }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine($"Preferences not found at default location: {defaultPrefsPath}");
+                }
+                
+                // If not found or failed, check current directory
+                if (loadedPrefs == null && File.Exists("preferences.json"))
+                {
+                    try
+                    {
+                        string prefsContent = File.ReadAllText("preferences.json");
+                        loadedPrefs = Newtonsoft.Json.JsonConvert.DeserializeObject<Preferences>(prefsContent);
+                        System.Diagnostics.Debug.WriteLine("Loaded preferences from current directory");
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"Failed to load preferences from current directory: {ex.Message}");
+                    }
+                }
+                
+                // Determine the actual data path
+                if (loadedPrefs != null && !string.IsNullOrEmpty(loadedPrefs.LauncherDataPath))
+                {
+                    appDataPath = loadedPrefs.LauncherDataPath;
+                    System.Diagnostics.Debug.WriteLine($"Using custom data path: {appDataPath}");
+                }
+                else
+                {
+                    appDataPath = defaultPath;
+                    System.Diagnostics.Debug.WriteLine($"Using default data path: {appDataPath}");
+                }
                 
                 if (!Directory.Exists(appDataPath))
                 {
                     Directory.CreateDirectory(appDataPath);
                 }
 
-                // Change working directory to AppData
+                // Change working directory to the determined path
                 Directory.SetCurrentDirectory(appDataPath);
 
-                Debug.Listeners.Add(new TextWriterTraceListener("Log.txt"));
-                Debug.AutoFlush = true;
-                Debug.WriteLine("=== Application Starting ===");
-                Debug.WriteLine($"Time: {DateTime.Now}");
-                Debug.WriteLine($"OS: {Environment.OSVersion}");
-                Debug.WriteLine($"AppData: {appDataPath}");
-
-                // Launch main window directly (no wizard)
+                // Launch main window
                 Debug.WriteLine("Creating main window");
                 var mainWindow = new ModernMainWindow();
+                
+                // Set as main window and change shutdown mode
+                Application.Current.MainWindow = mainWindow;
+                Application.Current.ShutdownMode = ShutdownMode.OnMainWindowClose;
+                
                 Debug.WriteLine("Showing main window");
                 mainWindow.Show();
                 Debug.WriteLine("Main window shown successfully");
+                Debug.WriteLine($"Main window IsVisible: {mainWindow.IsVisible}");
+                Debug.WriteLine($"Main window IsLoaded: {mainWindow.IsLoaded}");
+                Debug.WriteLine($"Application windows count: {Application.Current.Windows.Count}");
+                
+                // Keep the application running
+                Debug.WriteLine("OnStartup completed, application should remain running");
             }
             catch (Exception ex)
             {

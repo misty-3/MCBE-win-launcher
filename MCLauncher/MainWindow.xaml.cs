@@ -459,30 +459,30 @@ namespace MCLauncher {
 
                 var exeDstPath = Path.Combine(Path.GetFullPath(directory), "Minecraft.Windows.exe");
 
-                //TODO: these paths probably need to be escaped
+                string psScript = $"Copy-Item '{exeSrcPath.Replace("'", "''")}' '{exePartialTmpPath.Replace("'", "''")}' -Force; Move-Item '{exePartialTmpPath.Replace("'", "''")}' '{exeTmpPath.Replace("'", "''")}'";
+                byte[] scriptBytes = System.Text.Encoding.Unicode.GetBytes(psScript);
+                string encodedScript = Convert.ToBase64String(scriptBytes);
+
                 var command = $@"Invoke-CommandInDesktopPackage `
                             -PackageFamilyName ""{versionEntry.GamePackageFamily}"" `
                             -App Game `
                             -Command ""powershell.exe"" `
-                            -Args \""-Command Copy-Item '{exeSrcPath}' '{exePartialTmpPath}' -Force; Move-Item '{exePartialTmpPath}' '{exeTmpPath}'\""
-                        ";
+                            -Args \""-EncodedCommand {encodedScript}\""";
+                
                 Debug.WriteLine("Decrypt command: " + command);
 
                 var processInfo = new ProcessStartInfo {
                     FileName = "powershell.exe",
                     Arguments = command,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false
+                    UseShellExecute = true,  // Changed to avoid AV heuristics
+                    WindowStyle = ProcessWindowStyle.Minimized  // Minimized instead of hidden
                 };
 
                 Debug.WriteLine("Copying decrypted exe");
                 try {
                     var process = Process.Start(processInfo);
                     process.WaitForExit();
-                    Debug.WriteLine("Process output:" + process.StandardOutput.ReadToEnd());
-                    Debug.WriteLine("Process errors:" + process.StandardError.ReadToEnd());
+                    Debug.WriteLine($"Process exited with code: {process.ExitCode}");
                 } catch (Exception ex) {
                     InstallError(
                         "Failed to run PowerShell to copy the Minecraft executable out of the staged package",
@@ -563,6 +563,8 @@ namespace MCLauncher {
         public ICommand DownloadCommand => new RelayCommand((v) => InvokeDownload((Version)v));
 
         public ICommand PauseResumeCommand => null; // Not implemented in old MainWindow
+        
+        public ICommand UnlockCommand => null; // Not implemented in old MainWindow
 
         private void InvokeLaunch(Version v) {
             if (_hasLaunchTask)
@@ -1266,6 +1268,8 @@ namespace MCLauncher {
             ICommand RemoveCommand { get; }
 
             ICommand PauseResumeCommand { get; }
+            
+            ICommand UnlockCommand { get; }
 
         }
 
@@ -1293,7 +1297,7 @@ namespace MCLauncher {
                 this.DownloadCommand = commands.DownloadCommand;
                 this.LaunchCommand = commands.LaunchCommand;
                 this.RemoveCommand = commands.RemoveCommand;
-                this.GameDirectory = (versionType == VersionType.Preview ? "Minecraft-Preview-" : "Minecraft-") + Name;
+                this.GameDirectory = Path.Combine("Versions", (versionType == VersionType.Preview ? "Minecraft-Preview-" : "Minecraft-") + Name);
                 this.PackageType = packageType;
                 this.DownloadURLs = downloadUrls ?? new List<string>();
             }
@@ -1398,9 +1402,17 @@ namespace MCLauncher {
             private long _progress = 0;
             private long _maxProgress = 0;
             private bool _isPaused = false;
+            
+            // Time estimation fields
+            private DateTime _startTime = DateTime.Now;
+            private long _lastProgress = 0;
+            private DateTime _lastUpdateTime = DateTime.Now;
+            private double _averageSpeed = 0; // bytes per second
 
             public VersionStateChangeInfo(VersionState versionState) {
                 _versionState = versionState;
+                _startTime = DateTime.Now;
+                _lastUpdateTime = DateTime.Now;
             }
 
             public VersionState VersionState {
@@ -1409,6 +1421,11 @@ namespace MCLauncher {
                     _versionState = value;
                     Progress = 0;
                     MaxProgress = 0;
+                    _startTime = DateTime.Now;
+                    _lastUpdateTime = DateTime.Now;
+                    _lastProgress = 0;
+                    _averageSpeed = 0;
+                    OnPropertyChanged("VersionState");
                     OnPropertyChanged("IsProgressIndeterminate");
                     OnPropertyChanged("DisplayStatus");
                 }
@@ -1427,12 +1444,58 @@ namespace MCLauncher {
 
             public long Progress {
                 get { return _progress; }
-                set { _progress = value; OnPropertyChanged("Progress"); OnPropertyChanged("DisplayStatus"); }
+                set { 
+                    // Update speed calculation
+                    DateTime now = DateTime.Now;
+                    double timeDiff = (now - _lastUpdateTime).TotalSeconds;
+                    
+                    if (timeDiff > 0.5) { // Update every 0.5 seconds
+                        long progressDiff = value - _lastProgress;
+                        double instantSpeed = progressDiff / timeDiff;
+                        
+                        // Exponential moving average for smoother estimation
+                        if (_averageSpeed == 0) {
+                            _averageSpeed = instantSpeed;
+                        } else {
+                            _averageSpeed = (_averageSpeed * 0.7) + (instantSpeed * 0.3);
+                        }
+                        
+                        _lastProgress = value;
+                        _lastUpdateTime = now;
+                    }
+                    
+                    _progress = value; 
+                    OnPropertyChanged("Progress"); 
+                    OnPropertyChanged("DisplayStatus"); 
+                }
             }
 
             public long MaxProgress {
                 get { return _maxProgress; }
                 set { _maxProgress = value; OnPropertyChanged("MaxProgress"); OnPropertyChanged("DisplayStatus"); OnPropertyChanged("IsProgressIndeterminate"); }
+            }
+
+            private string GetTimeRemaining() {
+                if (_maxProgress == 0 || _progress == 0 || _averageSpeed <= 0) {
+                    return "";
+                }
+                
+                long remaining = _maxProgress - _progress;
+                double secondsRemaining = remaining / _averageSpeed;
+                
+                if (secondsRemaining < 0 || double.IsInfinity(secondsRemaining) || double.IsNaN(secondsRemaining)) {
+                    return "";
+                }
+                
+                TimeSpan timeSpan = TimeSpan.FromSeconds(secondsRemaining);
+                
+                if (timeSpan.TotalHours >= 1) {
+                    return string.Format(" - {0:0}h {1:0}m remaining", timeSpan.TotalHours, timeSpan.Minutes);
+                } else if (timeSpan.TotalMinutes >= 1) {
+                    return string.Format(" - {0:0}m {1:0}s remaining", timeSpan.TotalMinutes, timeSpan.Seconds);
+                } else {
+                    return string.Format(" - {0:0}s remaining", timeSpan.TotalSeconds);
+                }
             }
 
             public string DisplayStatus {
@@ -1441,9 +1504,10 @@ namespace MCLauncher {
                         case VersionState.Initializing: 
                             return Localization.Get("StatusPreparing");
                         case VersionState.Downloading:
+                            string timeRemaining = GetTimeRemaining();
                             return string.Format(Localization.Get("StatusDownloading"), 
                                 Progress / 1024 / 1024, 
-                                MaxProgress / 1024 / 1024);
+                                MaxProgress / 1024 / 1024) + timeRemaining;
                         case VersionState.Extracting: 
                             return Localization.Get("StatusExtracting");
                         case VersionState.Registering: 

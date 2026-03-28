@@ -70,23 +70,9 @@ namespace MCLauncher
 
         private void OpenLogFile_Click(object sender, RoutedEventArgs e)
         {
-            try
-            {
-                string logPath = Path.Combine(Directory.GetCurrentDirectory(), "Log.txt");
-                if (File.Exists(logPath))
-                {
-                    Process.Start("notepad.exe", logPath);
-                }
-                else
-                {
-                    MessageBox.Show("No log file found yet. The log file is created when you use the launcher.", 
-                        "No log file", MessageBoxButton.OK, MessageBoxImage.Information);
-                }
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Couldn't open log file: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-            }
+            // Log functionality removed
+            MessageBox.Show("Log functionality has been removed.", 
+                "Feature Removed", MessageBoxButton.OK, MessageBoxImage.Information);
         }
 
         private void ResetWarnings_Click(object sender, RoutedEventArgs e)

@@ -1,4 +1,4 @@
-﻿<Window x:Class="MCLauncher.VersionListEndpointDialog"
+<Window x:Class="MCLauncher.VersionListEndpointDialog"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
@@ -11,38 +11,84 @@
         MinWidth="400"
         WindowStartupLocation="CenterOwner"
         FocusManager.FocusedElement="{Binding ElementName=EndpointTextBox}"
-        Title="Set version data endpoints...">
-    <Grid Margin="5,5,5,5">
+        Title="Settings"
+        Background="#161925">
+    <Grid Margin="20">
         <Grid.Resources>
             <Style TargetType="{x:Type Button}">
-                <Setter Property="Width" Value="70" />
-                <Setter Property="Height" Value="25" />
-                <Setter Property="Margin" Value="5,0,0,0" />
+                <Setter Property="Width" Value="80" />
+                <Setter Property="Height" Value="32" />
+                <Setter Property="Margin" Value="10,0,0,0" />
+                <Setter Property="Background" Value="#3b82f6" />
+                <Setter Property="Foreground" Value="White" />
+                <Setter Property="BorderThickness" Value="0" />
+                <Setter Property="FontWeight" Value="Bold" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Border x:Name="border" Background="{TemplateBinding Background}" CornerRadius="6">
+                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="border" Property="Background" Value="#2563EB"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <Style TargetType="{x:Type Label}">
+                <Setter Property="Foreground" Value="#8b95b8" />
+                <Setter Property="FontWeight" Value="Bold" />
+                <Setter Property="Margin" Value="0,0,0,4" />
+                <Setter Property="Padding" Value="0" />
+            </Style>
+
+            <Style TargetType="{x:Type TextBox}">
+                <Setter Property="Background" Value="#12141c" />
+                <Setter Property="Foreground" Value="White" />
+                <Setter Property="BorderBrush" Value="#2d3555" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="Padding" Value="10,8" />
+                <Setter Property="Margin" Value="0,0,0,16" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="TextBox">
+                            <Border Background="{TemplateBinding Background}" 
+                                    BorderBrush="{TemplateBinding BorderBrush}" 
+                                    BorderThickness="{TemplateBinding BorderThickness}" 
+                                    CornerRadius="6">
+                                <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"/>
+                            </Border>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
             </Style>
         </Grid.Resources>
+        
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
-            <RowDefinition />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="Auto" />
-            <ColumnDefinition />
-        </Grid.ColumnDefinitions>
+        <TextBlock Text="Settings" FontSize="20" FontWeight="Bold" Foreground="White" Margin="0,0,0,20"/>
 
-        <Label Content="Legacy UWP version IDs endpoint (empty for default):" Grid.Row="0" Padding="0,5,0,5"/>
-        <TextBox Name="EndpointTextBox" Grid.Column="0" Grid.Row="1" Grid.ColumnSpan="2" Margin="0,5,0,5" />
+        <Label Content="Legacy UWP version IDs endpoint:" Grid.Row="1"/>
+        <TextBox Name="EndpointTextBox" Grid.Row="2" />
 
-        <Label Content="GDK package URLs endpoint (empty for default):" Grid.Row="2" Padding="0,5,0,5"/>
-        <TextBox Name="GDKUrlsEndpointTextBox" Grid.Column="0" Grid.Row="3" Grid.ColumnSpan="2" Margin="0,5,0,5" />
+        <Label Content="GDK package URLs endpoint:" Grid.Row="3"/>
+        <TextBox Name="GDKUrlsEndpointTextBox" Grid.Row="4" />
 
-        <StackPanel Grid.Column="0" Grid.ColumnSpan="2" Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,5,0,0">
-            <Button Name="okButton" Click="okButton_Click" IsDefault="True">OK</Button>
-            <Button Name="cancelButton" Click="cancelButton_Click" IsCancel="True">Cancel</Button>
+        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+            <Button Name="cancelButton" Click="cancelButton_Click" IsCancel="True" Background="#2d3555">Cancel</Button>
+            <Button Name="okButton" Click="okButton_Click" IsDefault="True">Save</Button>
         </StackPanel>
     </Grid>
 </Window>

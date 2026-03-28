@@ -4,41 +4,53 @@
         Title="Welcome to Minecraft Version Launcher!" 
         Height="550" Width="700"
         WindowStartupLocation="CenterScreen"
-        Background="#F5F5F5"
+        Background="{DynamicResource AppBackground}"
         ResizeMode="NoResize">
     
     <Window.Resources>
-        <SolidColorBrush x:Key="MinecraftGreen" Color="#7CB342"/>
-        <SolidColorBrush x:Key="MinecraftDarkGreen" Color="#558B2F"/>
-        <SolidColorBrush x:Key="CreeperGreen" Color="#00C853"/>
-        <SolidColorBrush x:Key="CardBackground" Color="#FFFFFF"/>
-        <SolidColorBrush x:Key="TextPrimary" Color="#212121"/>
-        <SolidColorBrush x:Key="TextSecondary" Color="#757575"/>
+        <SolidColorBrush x:Key="AppBackground" Color="#161925"/>
+        <SolidColorBrush x:Key="CardBg" Color="#202538"/>
+        <SolidColorBrush x:Key="DarkBg" Color="#12141c"/>
+        <SolidColorBrush x:Key="Border" Color="#2d3555"/>
+        <SolidColorBrush x:Key="TextPrimary" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="TextSecondary" Color="#8b95b8"/>
+        <SolidColorBrush x:Key="AccentBlue" Color="#3b82f6"/>
+        <SolidColorBrush x:Key="AccentGreen" Color="#10b981"/>
+        
+        <LinearGradientBrush x:Key="AccentGradient" StartPoint="0,0" EndPoint="1,1">
+            <GradientStop Color="#3b82f6" Offset="0"/>
+            <GradientStop Color="#8b5cf6" Offset="1"/>
+        </LinearGradientBrush>
+
+        <DropShadowEffect x:Key="ButtonShadow" Color="Black" BlurRadius="10" Opacity="0.3" Direction="270" ShadowDepth="4"/>
+        <DropShadowEffect x:Key="CardShadow" Color="Black" BlurRadius="15" Opacity="0.2" Direction="270" ShadowDepth="5"/>
 
         <Style x:Key="ModernButton" TargetType="Button">
-            <Setter Property="Background" Value="{StaticResource MinecraftGreen}"/>
+            <Setter Property="Background" Value="{StaticResource AccentBlue}"/>
             <Setter Property="Foreground" Value="White"/>
             <Setter Property="FontSize" Value="14"/>
             <Setter Property="FontWeight" Value="Bold"/>
             <Setter Property="Padding" Value="25,12"/>
             <Setter Property="BorderThickness" Value="0"/>
             <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Effect" Value="{StaticResource ButtonShadow}"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
-                        <Border Background="{TemplateBinding Background}" 
-                                CornerRadius="5"
+                        <Border x:Name="border"
+                                Background="{TemplateBinding Background}" 
+                                CornerRadius="8"
                                 Padding="{TemplateBinding Padding}">
                             <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
                         </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="border" Property="Background" Value="#2563EB"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
-            <Style.Triggers>
-                <Trigger Property="IsMouseOver" Value="True">
-                    <Setter Property="Background" Value="{StaticResource MinecraftDarkGreen}"/>
-                </Trigger>
-            </Style.Triggers>
         </Style>
 
         <Style x:Key="BigButton" TargetType="Button" BasedOn="{StaticResource ModernButton}">
@@ -55,23 +67,24 @@
         </Grid.RowDefinitions>
 
         <!-- Header -->
-        <Border Grid.Row="0" Background="{StaticResource MinecraftGreen}" Padding="30">
+        <Border Grid.Row="0" Background="{StaticResource CardBg}" BorderBrush="{StaticResource Border}" BorderThickness="0,0,0,1" Padding="30">
             <StackPanel HorizontalAlignment="Center">
-                <TextBlock Text="🎮" 
-                           FontSize="48" 
-                           HorizontalAlignment="Center"/>
+                <Border CornerRadius="24" Width="80" Height="80" Margin="0,0,0,16" Background="{StaticResource AccentGradient}" Effect="{StaticResource CardShadow}">
+                    <TextBlock Text="🎮" 
+                               FontSize="48" 
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"/>
+                </Border>
                 <TextBlock Text="Welcome to Minecraft Version Launcher!" 
                            FontSize="26" 
-                           FontWeight="Bold" 
-                           Foreground="White"
+                           FontWeight="ExtraBold" 
+                           Foreground="{StaticResource TextPrimary}"
                            HorizontalAlignment="Center"
-                           Margin="0,10,0,0"/>
+                           Margin="0,0,0,4"/>
                 <TextBlock Text="Let's get you set up in just a few steps!" 
-                           FontSize="14" 
-                           Foreground="White" 
-                           Opacity="0.9"
-                           HorizontalAlignment="Center"
-                           Margin="0,5,0,0"/>
+                           FontSize="15" 
+                           Foreground="{StaticResource TextSecondary}" 
+                           HorizontalAlignment="Center"/>
             </StackPanel>
         </Border>
 
@@ -86,15 +99,19 @@
                            HorizontalAlignment="Center"
                            Margin="0,20,0,30"/>
 
-                <Border Background="{StaticResource CardBackground}" 
-                        CornerRadius="8" 
+                <Border Background="{StaticResource CardBg}" 
+                        BorderBrush="{StaticResource Border}"
+                        BorderThickness="1"
+                        CornerRadius="12" 
                         Padding="20"
-                        Margin="0,0,0,15">
+                        Margin="0,0,0,15"
+                        Effect="{StaticResource CardShadow}">
                     <StackPanel Orientation="Horizontal">
                         <TextBlock Text="✓" 
                                    FontSize="32"
-                                   Foreground="{StaticResource CreeperGreen}"
-                                   Margin="0,0,15,0"
+                                   FontWeight="Bold"
+                                   Foreground="{StaticResource AccentGreen}"
+                                   Margin="0,0,20,0"
                                    VerticalAlignment="Top"/>
                         <StackPanel>
                             <TextBlock Text="Play different versions of Minecraft" 
@@ -110,15 +127,19 @@
                     </StackPanel>
                 </Border>
 
-                <Border Background="{StaticResource CardBackground}" 
-                        CornerRadius="8" 
+                <Border Background="{StaticResource CardBg}" 
+                        BorderBrush="{StaticResource Border}"
+                        BorderThickness="1"
+                        CornerRadius="12" 
                         Padding="20"
-                        Margin="0,0,0,15">
+                        Margin="0,0,0,15"
+                        Effect="{StaticResource CardShadow}">
                     <StackPanel Orientation="Horizontal">
                         <TextBlock Text="✓" 
                                    FontSize="32"
-                                   Foreground="{StaticResource CreeperGreen}"
-                                   Margin="0,0,15,0"
+                                   FontWeight="Bold"
+                                   Foreground="{StaticResource AccentGreen}"
+                                   Margin="0,0,20,0"
                                    VerticalAlignment="Top"/>
                         <StackPanel>
                             <TextBlock Text="Try Preview features early" 
@@ -134,14 +155,18 @@
                     </StackPanel>
                 </Border>
 
-                <Border Background="{StaticResource CardBackground}" 
-                        CornerRadius="8" 
-                        Padding="20">
+                <Border Background="{StaticResource CardBg}" 
+                        BorderBrush="{StaticResource Border}"
+                        BorderThickness="1"
+                        CornerRadius="12" 
+                        Padding="20"
+                        Effect="{StaticResource CardShadow}">
                     <StackPanel Orientation="Horizontal">
                         <TextBlock Text="✓" 
                                    FontSize="32"
-                                   Foreground="{StaticResource CreeperGreen}"
-                                   Margin="0,0,15,0"
+                                   FontWeight="Bold"
+                                   Foreground="{StaticResource AccentGreen}"
+                                   Margin="0,0,20,0"
                                    VerticalAlignment="Top"/>
                         <StackPanel>
                             <TextBlock Text="Your worlds stay safe" 
@@ -167,10 +192,13 @@
                            HorizontalAlignment="Center"
                            Margin="0,20,0,30"/>
 
-                <Border Background="{StaticResource CardBackground}" 
-                        CornerRadius="8" 
+                <Border Background="{StaticResource CardBg}" 
+                        BorderBrush="{StaticResource Border}"
+                        BorderThickness="1"
+                        CornerRadius="12" 
                         Padding="25"
-                        Margin="0,0,0,20">
+                        Margin="0,0,0,20"
+                        Effect="{StaticResource CardShadow}">
                     <StackPanel>
                         <TextBlock Text="✓ You need these things:" 
                                    FontSize="18"
@@ -225,11 +253,11 @@
                     </StackPanel>
                 </Border>
 
-                <Border Background="#FFF3E0" 
+                <Border Background="#2a1b18" 
                         CornerRadius="8" 
                         Padding="20"
                         BorderBrush="#FF9800"
-                        BorderThickness="2">
+                        BorderThickness="1">
                     <StackPanel Orientation="Horizontal">
                         <TextBlock Text="⚠️" FontSize="24" Margin="0,0,10,0" VerticalAlignment="Top"/>
                         <TextBlock TextWrapping="Wrap" 
@@ -251,10 +279,13 @@
                            HorizontalAlignment="Center"
                            Margin="0,40,0,30"/>
 
-                <Border Background="{StaticResource CardBackground}" 
-                        CornerRadius="8" 
+                <Border Background="{StaticResource CardBg}" 
+                        BorderBrush="{StaticResource Border}"
+                        BorderThickness="1"
+                        CornerRadius="12" 
                         Padding="30"
-                        HorizontalAlignment="Center">
+                        HorizontalAlignment="Center"
+                        Effect="{StaticResource CardShadow}">
                     <StackPanel HorizontalAlignment="Center">
                         <TextBlock Text="🎮" 
                                    FontSize="64" 
@@ -273,35 +304,37 @@
                                        Foreground="{StaticResource TextSecondary}"
                                        Margin="0,0,0,10"
                                        TextWrapping="Wrap">
-                                <Bold>1.</Bold> Go to the "Available" tab
+                                <Bold Foreground="{StaticResource AccentBlue}">1.</Bold> Go to the "Available" tab
                             </TextBlock>
                             <TextBlock FontSize="14" 
                                        Foreground="{StaticResource TextSecondary}"
                                        Margin="0,0,0,10"
                                        TextWrapping="Wrap">
-                                <Bold>2.</Bold> Find a version with a ⭐ (recommended!)
+                                <Bold Foreground="{StaticResource AccentBlue}">2.</Bold> Find a version with a ⭐ (recommended!)
                             </TextBlock>
                             <TextBlock FontSize="14" 
                                        Foreground="{StaticResource TextSecondary}"
                                        Margin="0,0,0,10"
                                        TextWrapping="Wrap">
-                                <Bold>3.</Bold> Click "Download" and wait
+                                <Bold Foreground="{StaticResource AccentBlue}">3.</Bold> Click "Download" and wait
                             </TextBlock>
                             <TextBlock FontSize="14" 
                                        Foreground="{StaticResource TextSecondary}"
                                        Margin="0,0,0,10"
                                        TextWrapping="Wrap">
-                                <Bold>4.</Bold> Go to "My Versions" and click "PLAY"!
+                                <Bold Foreground="{StaticResource AccentBlue}">4.</Bold> Go to "My Versions" and click "PLAY"!
                             </TextBlock>
                         </StackPanel>
 
-                        <Border Background="#E8F5E9" 
-                                CornerRadius="5" 
+                        <Border Background="{StaticResource DarkBg}" 
+                                BorderBrush="{StaticResource Border}"
+                                BorderThickness="1"
+                                CornerRadius="8" 
                                 Padding="15"
                                 Margin="0,20,0,0">
                             <TextBlock TextWrapping="Wrap" 
                                        FontSize="13"
-                                       Foreground="{StaticResource TextPrimary}"
+                                       Foreground="{StaticResource TextSecondary}"
                                        HorizontalAlignment="Center">
                                 💡 Tip: If you need help, check the "Help" tab anytime!
                             </TextBlock>
@@ -312,7 +345,7 @@
         </Grid>
 
         <!-- Footer Navigation -->
-        <Border Grid.Row="2" Background="White" BorderBrush="#E0E0E0" BorderThickness="0,1,0,0" Padding="30,20">
+        <Border Grid.Row="2" Background="{StaticResource CardBg}" BorderBrush="{StaticResource Border}" BorderThickness="0,1,0,0" Padding="30,20">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
@@ -324,7 +357,8 @@
                         Grid.Column="0"
                         Content="← Back" 
                         Style="{StaticResource ModernButton}"
-                        Background="#9E9E9E"
+                        Background="{StaticResource Border}"
+                        Foreground="{StaticResource TextPrimary}"
                         Click="Back_Click"
                         HorizontalAlignment="Left"
                         Visibility="Collapsed"/>
@@ -332,9 +366,9 @@
                 <StackPanel Grid.Column="1" 
                             Orientation="Horizontal" 
                             HorizontalAlignment="Center">
-                    <Ellipse x:Name="Dot1" Width="12" Height="12" Fill="{StaticResource MinecraftGreen}" Margin="5"/>
-                    <Ellipse x:Name="Dot2" Width="12" Height="12" Fill="#E0E0E0" Margin="5"/>
-                    <Ellipse x:Name="Dot3" Width="12" Height="12" Fill="#E0E0E0" Margin="5"/>
+                    <Ellipse x:Name="Dot1" Width="10" Height="10" Fill="{StaticResource AccentBlue}" Margin="6"/>
+                    <Ellipse x:Name="Dot2" Width="10" Height="10" Fill="{StaticResource Border}" Margin="6"/>
+                    <Ellipse x:Name="Dot3" Width="10" Height="10" Fill="{StaticResource Border}" Margin="6"/>
                 </StackPanel>
 
                 <Button x:Name="NextButton" 
